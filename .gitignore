@@ -39,3 +39,12 @@
 
 # debug information files
 *.dwo
+
+# Python virtual environment and caches
+venv/
+__pycache__/
+*.pyc
+
+# Local environment and runtime logs
+.env
+logs/

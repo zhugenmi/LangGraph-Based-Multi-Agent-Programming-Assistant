@@ -1,0 +1,13 @@
+langgraph
+langchain-core
+langchain-community
+langchain_openai
+redis
+pylint
+mypy
+GitPython
+python-dotenv
+faiss-cpu
+flask
+flask-cors
+requests

@@ -1,0 +1,1163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LangGraph-Based Multi-Agent Programming Assistant - 多Agent编程助手</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg: #070b14;
+            --bg-panel: #101a2e;
+            --bg-card: #171f33;
+            --text-primary: #f1f5ff;
+            --text-secondary: #a9b8d6;
+            --text-muted: #8290ad;
+            --accent: #5ea1ff;
+            --accent-2: #7d6bff;
+            --success: #2ec987;
+            --warning: #f4a844;
+            --error: #ff6078;
+            --border: rgba(173, 197, 255, 0.22);
+        }
+
+        body {
+            font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+            background:
+                radial-gradient(circle at 18% 0%, rgba(94, 161, 255, 0.2), transparent 28%),
+                radial-gradient(circle at 76% 2%, rgba(125, 107, 255, 0.2), transparent 24%),
+                var(--bg);
+            color: var(--text-primary);
+            min-height: 100vh;
+            line-height: 1.55;
+        }
+
+        .app-container {
+            max-width: 1460px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        .app-header {
+            margin-bottom: 14px;
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            background: rgba(16, 26, 46, 0.92);
+            padding: 20px;
+        }
+
+        .tag-line {
+            display: inline-flex;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            border: 1px solid rgba(94, 161, 255, 0.4);
+            background: rgba(94, 161, 255, 0.12);
+            margin-bottom: 10px;
+        }
+
+        .app-title {
+            font-size: clamp(1.3rem, 2.5vw, 2rem);
+            margin-bottom: 6px;
+        }
+
+        .app-subtitle {
+            color: var(--text-secondary);
+            font-size: 0.92rem;
+        }
+
+        .main-layout {
+            display: grid;
+            grid-template-columns: 3fr 7fr;
+            gap: 14px;
+            align-items: stretch;
+        }
+
+        .panel {
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            background: rgba(16, 26, 46, 0.94);
+            overflow: hidden;
+            min-height: 76vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .panel-header {
+            padding: 13px 15px;
+            border-bottom: 1px solid rgba(173, 197, 255, 0.18);
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            font-size: 0.96rem;
+            font-weight: 600;
+        }
+
+        .panel-content {
+            padding: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            min-height: 0;
+        }
+
+        .input-label {
+            font-size: 0.84rem;
+            color: var(--text-secondary);
+        }
+
+        .text-input {
+            width: 100%;
+            min-height: 90px;
+            max-height: 170px;
+            resize: vertical;
+            border: 1px solid rgba(173, 197, 255, 0.2);
+            border-radius: 8px;
+            background: var(--bg-card);
+            color: var(--text-primary);
+            padding: 10px;
+            font: inherit;
+        }
+
+        .text-input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 2px rgba(94, 161, 255, 0.18);
+        }
+
+        .btn-primary {
+            width: 100%;
+            border: none;
+            border-radius: 9px;
+            padding: 10px 12px;
+            color: white;
+            background: linear-gradient(135deg, var(--accent), var(--accent-2));
+            cursor: pointer;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .btn-primary:disabled {
+            cursor: not-allowed;
+            opacity: 0.7;
+        }
+
+        .status-bar {
+            font-size: 0.84rem;
+            border-radius: 8px;
+            padding: 8px 9px;
+            display: none;
+        }
+
+        .status-bar.show { display: block; }
+        .status-bar.info { background: rgba(94, 161, 255, 0.14); color: #d5e6ff; }
+        .status-bar.success { background: rgba(46, 201, 135, 0.14); color: #c8f8e2; }
+        .status-bar.error { background: rgba(255, 96, 120, 0.14); color: #ffd2da; }
+
+        .progress-container { display: none; }
+        .progress-container.active { display: block; }
+        .progress-bar {
+            height: 7px;
+            border-radius: 999px;
+            background: rgba(173, 197, 255, 0.16);
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            width: 0%;
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent), var(--accent-2));
+            transition: width 0.3s ease;
+        }
+
+        .dynamic-module {
+            flex: 1;
+            min-height: 0;
+            border: 1px solid rgba(173, 197, 255, 0.17);
+            border-radius: 10px;
+            background: rgba(11, 18, 31, 0.72);
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .module-title {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .workflow-pipeline {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 7px;
+        }
+
+        .pipeline-step {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            border: 1px solid var(--border);
+            border-radius: 9px;
+            padding: 8px 10px;
+            background: rgba(19, 28, 48, 0.88);
+            transition: 0.2s ease;
+        }
+
+        .pipeline-step.pending { opacity: 0.55; }
+        .pipeline-step.active {
+            border-color: rgba(94, 161, 255, 0.8);
+            background: rgba(94, 161, 255, 0.14);
+        }
+        .pipeline-step.completed {
+            border-color: rgba(46, 201, 135, 0.7);
+            background: rgba(46, 201, 135, 0.14);
+        }
+        .pipeline-step.error {
+            border-color: rgba(255, 96, 120, 0.72);
+            background: rgba(255, 96, 120, 0.14);
+        }
+
+        .step-icon { font-size: 1.1rem; }
+        .step-name { font-size: 0.88rem; font-weight: 600; min-width: 62px; }
+        .step-status-text { font-size: 0.8rem; color: var(--text-muted); }
+
+        .pipeline-arrow {
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 1rem;
+            line-height: 1;
+        }
+
+        .pipeline-arrow.active { color: var(--accent); }
+
+        .loop-visual {
+            border: 1px solid rgba(173, 197, 255, 0.18);
+            border-radius: 9px;
+            padding: 8px 10px;
+            background: rgba(19, 28, 48, 0.9);
+            font-size: 0.84rem;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .loop-badge {
+            border-radius: 999px;
+            padding: 3px 8px;
+            font-size: 0.75rem;
+            border: 1px solid rgba(173, 197, 255, 0.3);
+            color: var(--text-muted);
+            background: rgba(173, 197, 255, 0.08);
+        }
+
+        .loop-badge.active {
+            color: #cde2ff;
+            border-color: rgba(94, 161, 255, 0.6);
+            background: rgba(94, 161, 255, 0.18);
+        }
+
+        .loop-badge.pass {
+            color: #cbf8e4;
+            border-color: rgba(46, 201, 135, 0.6);
+            background: rgba(46, 201, 135, 0.18);
+        }
+
+        .loop-badge.fail {
+            color: #ffe4be;
+            border-color: rgba(244, 168, 68, 0.62);
+            background: rgba(244, 168, 68, 0.18);
+        }
+
+        .agent-log {
+            flex: 1;
+            min-height: 0;
+            max-height: 100%;
+            overflow-y: auto;
+            border: 1px solid rgba(173, 197, 255, 0.16);
+            border-radius: 8px;
+            background: rgba(8, 14, 26, 0.9);
+        }
+
+        .log-entry {
+            display: flex;
+            gap: 8px;
+            padding: 7px 9px;
+            font-size: 0.79rem;
+            border-bottom: 1px solid rgba(173, 197, 255, 0.1);
+        }
+
+        .log-entry:last-child { border-bottom: none; }
+        .log-time { min-width: 60px; color: var(--text-muted); }
+        .log-agent { min-width: 60px; font-weight: 600; color: var(--accent); text-transform: capitalize; }
+        .log-agent.generator { color: var(--accent-2); }
+        .log-agent.reviewer { color: var(--warning); }
+        .log-agent.fixer { color: var(--success); }
+        .log-message { color: var(--text-secondary); }
+        .log-entry.completed .log-message { color: var(--success); }
+        .log-entry.error .log-message { color: var(--error); }
+
+        .results-container {
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            display: grid;
+            gap: 10px;
+            padding-right: 2px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 26px 14px;
+            border: 1px dashed rgba(173, 197, 255, 0.28);
+            border-radius: 10px;
+            background: rgba(19, 28, 48, 0.82);
+            color: var(--text-secondary);
+        }
+
+        .empty-icon { font-size: 1.8rem; margin-bottom: 8px; }
+
+        .result-card {
+            border: 1px solid rgba(173, 197, 255, 0.18);
+            border-radius: 10px;
+            background: rgba(18, 27, 46, 0.9);
+            overflow: hidden;
+        }
+
+        .result-card.success { border-color: rgba(46, 201, 135, 0.46); }
+        .result-card.warning { border-color: rgba(244, 168, 68, 0.46); }
+        .result-card.error { border-color: rgba(255, 96, 120, 0.46); }
+
+        .card-header {
+            padding: 9px 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            border-bottom: 1px solid rgba(173, 197, 255, 0.13);
+        }
+
+        .card-title {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        .card-body {
+            padding: 10px;
+            color: var(--text-secondary);
+            font-size: 0.88rem;
+        }
+
+        .card-actions { display: inline-flex; gap: 6px; }
+
+        .btn-small {
+            border-radius: 7px;
+            padding: 4px 7px;
+            border: 1px solid rgba(173, 197, 255, 0.3);
+            background: rgba(12, 20, 36, 0.92);
+            color: #dbe8ff;
+            cursor: pointer;
+            font-size: 0.76rem;
+        }
+
+        .btn-small.primary { border-color: rgba(94, 161, 255, 0.58); }
+        .btn-small.success { border-color: rgba(46, 201, 135, 0.58); }
+
+        .code-block {
+            background: #0a1123;
+            border: 1px solid rgba(173, 197, 255, 0.15);
+            border-radius: 8px;
+            padding: 9px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-size: 0.8rem;
+            color: #dbe7ff;
+            font-family: "Consolas", "Monaco", monospace;
+        }
+
+        .task-plan-box, .review-issues {
+            display: grid;
+            gap: 8px;
+        }
+
+        .plan-main-task {
+            border-radius: 8px;
+            padding: 8px;
+            background: rgba(94, 161, 255, 0.14);
+            color: #d8e8ff;
+        }
+
+        .subtask-item, .issue-item {
+            border: 1px solid rgba(173, 197, 255, 0.15);
+            border-radius: 8px;
+            padding: 8px;
+            background: rgba(13, 21, 37, 0.85);
+        }
+
+        .subtask-id { color: var(--accent); margin-right: 6px; font-weight: 600; }
+        .subtask-desc { color: var(--text-primary); }
+        .subtask-deps { margin-top: 4px; color: var(--text-muted); font-size: 0.8rem; }
+
+        .review-summary {
+            display: flex;
+            gap: 7px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .review-score,
+        .review-verdict {
+            border-radius: 999px;
+            padding: 3px 8px;
+            font-size: 0.76rem;
+        }
+
+        .review-score { background: rgba(94, 161, 255, 0.18); color: #d4e5ff; }
+        .review-verdict.pass { background: rgba(46, 201, 135, 0.18); color: #ccf8e6; }
+        .review-verdict.fail { background: rgba(244, 168, 68, 0.18); color: #ffe5bf; }
+
+        .issue-badge {
+            border-radius: 999px;
+            padding: 2px 7px;
+            font-size: 0.7rem;
+            font-weight: 600;
+        }
+
+        .issue-badge.warning { background: rgba(244, 168, 68, 0.22); color: #ffd89f; }
+        .issue-badge.error { background: rgba(255, 96, 120, 0.22); color: #ffcfda; }
+        .issue-badge.info { background: rgba(94, 161, 255, 0.22); color: #d0e4ff; }
+        .issue-desc { margin-top: 4px; color: var(--text-primary); }
+        .issue-suggestion { margin-top: 4px; color: var(--text-secondary); font-size: 0.82rem; }
+
+        .execution-result {
+            margin: 8px 10px 10px;
+            border-radius: 8px;
+            padding: 8px;
+            display: none;
+        }
+
+        .execution-result.show { display: block; }
+        .execution-result.info { background: rgba(94, 161, 255, 0.14); }
+        .execution-result.success { background: rgba(46, 201, 135, 0.14); }
+        .execution-result.error { background: rgba(255, 96, 120, 0.14); }
+
+        .execution-output {
+            margin-top: 5px;
+            border-radius: 6px;
+            padding: 7px;
+            white-space: pre-wrap;
+            font-size: 0.78rem;
+            color: #dbe8ff;
+            background: #0a1123;
+            font-family: "Consolas", "Monaco", monospace;
+        }
+
+        .execution-time {
+            margin-top: 5px;
+            color: var(--text-muted);
+            font-size: 0.78rem;
+        }
+
+        .spinner {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            border: 2px solid rgba(255, 255, 255, 0.28);
+            border-top-color: white;
+            animation: spin 0.75s linear infinite;
+            display: inline-block;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        @media (max-width: 1180px) {
+            .main-layout { grid-template-columns: 1fr; }
+            .panel { min-height: 58vh; }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <header class="app-header">
+            <span class="tag-line">LangGraph Workflow · Multi-Agent Collaboration</span>
+            <h1 class="app-title">🤖 LangGraph-Based Multi-Agent Programming Assistant</h1>
+            <p class="app-subtitle">任务规划 → 代码生成 → 审查 → 修正，可循环迭代直至审查通过。</p>
+        </header>
+
+        <div class="main-layout">
+            <section class="panel">
+                <div class="panel-header">
+                    <span>🛰️</span>
+                    <span>任务输入与执行监控（动态）</span>
+                </div>
+                <div class="panel-content">
+                    <label class="input-label" for="task-input">请输入待实现或重构任务</label>
+                    <textarea id="task-input" class="text-input" placeholder="示例：用 Python 实现快速排序，加入边界处理并补充单元测试"></textarea>
+
+                    <button class="btn-primary" id="generate-btn" onclick="generateCode()">
+                        <span>🚀</span>
+                        <span>启动多 Agent 工作流</span>
+                    </button>
+
+                    <div class="status-bar" id="status-bar"></div>
+
+                    <div class="progress-container" id="progress-container">
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progress-fill"></div>
+                        </div>
+                    </div>
+
+                    <div class="dynamic-module">
+                        <div class="module-title">流程动态</div>
+                        <div class="workflow-pipeline">
+                            <div class="pipeline-step pending" id="step-plan">
+                                <span class="step-icon">📋</span>
+                                <span class="step-name">任务规划</span>
+                                <span class="step-status-text">等待中</span>
+                            </div>
+                            <span class="pipeline-arrow" id="arrow-1">↓</span>
+                            <div class="pipeline-step pending" id="step-generate">
+                                <span class="step-icon">💻</span>
+                                <span class="step-name">代码生成</span>
+                                <span class="step-status-text">等待中</span>
+                            </div>
+                            <span class="pipeline-arrow" id="arrow-2">↓</span>
+                            <div class="pipeline-step pending" id="step-review">
+                                <span class="step-icon">🔍</span>
+                                <span class="step-name">代码审查</span>
+                                <span class="step-status-text">等待中</span>
+                            </div>
+                            <span class="pipeline-arrow" id="arrow-3">↓</span>
+                            <div class="pipeline-step pending" id="step-fix">
+                                <span class="step-icon">🔧</span>
+                                <span class="step-name">代码修正</span>
+                                <span class="step-status-text">等待中</span>
+                            </div>
+                        </div>
+
+                        <div class="loop-visual">
+                            <span id="loop-text">审查结果：等待中（未进入循环）</span>
+                            <span class="loop-badge" id="loop-badge">待判定</span>
+                        </div>
+
+                        <div class="module-title">执行日志</div>
+                        <div class="agent-log" id="agent-log" style="display: none;">
+                            <div class="log-entry" id="log-template" style="display: none;">
+                                <span class="log-time"></span>
+                                <span class="log-agent"></span>
+                                <span class="log-message"></span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel">
+                <div class="panel-header">
+                    <span>📦</span>
+                    <span>流程结果与代码产物（滚动）</span>
+                </div>
+                <div class="panel-content">
+                    <div class="results-container" id="results-container">
+                        <div class="empty-state" id="empty-state">
+                            <div class="empty-icon">🧠</div>
+                            <p>输入任务后点击“启动多 Agent 工作流”，右侧固定窗口将滚动展示流程结果与代码产物。</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <script>
+        const stepIds = ['plan', 'generate', 'review', 'fix'];
+        const agentNames = {
+            'plan': 'planner',
+            'generate': 'generator',
+            'review': 'reviewer',
+            'fix': 'fixer'
+        };
+        const stepProgress = { 'plan': 15, 'generate': 35, 'review': 60, 'fix': 85 };
+
+        function resetPipeline() {
+            stepIds.forEach(step => {
+                const el = document.getElementById(`step-${step}`);
+                el.className = 'pipeline-step pending';
+                el.querySelector('.step-status-text').textContent = '等待中';
+            });
+            for (let i = 1; i <= 3; i++) {
+                document.getElementById(`arrow-${i}`).classList.remove('active');
+            }
+            updateReviewLoopVisual('idle');
+        }
+
+        function updatePipelineStep(step, status, message) {
+            const el = document.getElementById(`step-${step}`);
+            const statusText = el.querySelector('.step-status-text');
+            const stepIndex = stepIds.indexOf(step);
+
+            el.className = `pipeline-step ${status}`;
+            statusText.textContent = message || (status === 'completed' ? '已完成' : status === 'active' ? '进行中' : status === 'error' ? '失败' : '等待中');
+
+            if (status === 'completed') {
+                for (let i = 0; i < stepIndex; i++) {
+                    const prevEl = document.getElementById(`step-${stepIds[i]}`);
+                    prevEl.className = 'pipeline-step completed';
+                    prevEl.querySelector('.step-status-text').textContent = '已完成';
+                }
+                if (stepIndex < 3) {
+                    document.getElementById(`arrow-${stepIndex + 1}`).classList.add('active');
+                }
+            }
+        }
+
+        function updateReviewLoopVisual(state) {
+            const text = document.getElementById('loop-text');
+            const badge = document.getElementById('loop-badge');
+            badge.className = 'loop-badge';
+
+            if (state === 'idle') {
+                text.textContent = '审查结果：等待中（未进入循环）';
+                badge.textContent = '待判定';
+                return;
+            }
+            if (state === 'reviewing') {
+                text.textContent = '审查中：正在评估当前代码质量';
+                badge.classList.add('active');
+                badge.textContent = '审查中';
+                return;
+            }
+            if (state === 'looping') {
+                text.textContent = '审查未通过：进入 修正 → 再审查 循环';
+                badge.classList.add('fail');
+                badge.textContent = '未通过';
+                return;
+            }
+            if (state === 'awaiting_recheck') {
+                text.textContent = '修正已完成：等待再次审查结果';
+                badge.classList.add('fail');
+                badge.textContent = '待复审';
+                return;
+            }
+            if (state === 'passed') {
+                text.textContent = '审查通过：流程可结束';
+                badge.classList.add('pass');
+                badge.textContent = '通过';
+                return;
+            }
+            if (state === 'error') {
+                text.textContent = '流程异常：请查看日志与错误卡片';
+                badge.classList.add('fail');
+                badge.textContent = '异常';
+            }
+        }
+
+        function showStatus(message, type = 'info') {
+            const bar = document.getElementById('status-bar');
+            bar.innerHTML = message;
+            bar.className = `status-bar show ${type}`;
+        }
+
+        function showProgress(show) {
+            document.getElementById('progress-container').classList.toggle('active', show);
+        }
+
+        function setProgress(percent) {
+            document.getElementById('progress-fill').style.width = `${percent}%`;
+        }
+
+        function setLoading(loading) {
+            const btn = document.getElementById('generate-btn');
+            btn.disabled = loading;
+            btn.innerHTML = loading
+                ? '<span class="spinner"></span><span>执行中...</span>'
+                : '<span>🚀</span><span>启动多 Agent 工作流</span>';
+        }
+
+        function encodeCodePayload(text) {
+            return btoa(unescape(encodeURIComponent(text || '')));
+        }
+
+        function decodeCodePayload(encoded) {
+            try {
+                return decodeURIComponent(escape(atob(encoded || '')));
+            } catch (e) {
+                return '';
+            }
+        }
+
+        function escapeHtml(text) {
+            if (typeof text !== 'string') return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function extractCodeFromMarkdown(text) {
+            if (!text) return '';
+            const codeMatch = text.match(/```python\s*([\s\S]*?)\s*```/);
+            if (codeMatch) return codeMatch[1];
+            const genericMatch = text.match(/```\s*([\s\S]*?)\s*```/);
+            if (genericMatch) {
+                const code = genericMatch[1];
+                if (code.includes('def ') || code.includes('class ') || code.includes('import ')) {
+                    return code;
+                }
+            }
+            const lines = text.split('\n');
+            const codeStart = lines.findIndex(l =>
+                l.trim().startsWith('def ') || l.trim().startsWith('class ') ||
+                l.trim().startsWith('import ') || l.trim().startsWith('from ')
+            );
+            if (codeStart !== -1) return lines.slice(codeStart).join('\n');
+            return text.trim();
+        }
+
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                showStatus('✅ 代码已复制到剪贴板', 'success');
+            }).catch(() => {
+                showStatus('❌ 复制失败', 'error');
+            });
+        }
+
+        async function executeCode(btn, code) {
+            const codeToRun = extractCodeFromMarkdown(code);
+            if (!codeToRun.trim()) {
+                alert('没有可执行的代码');
+                return;
+            }
+
+            const originalText = btn.textContent;
+            btn.textContent = '执行中...';
+            btn.disabled = true;
+
+            let resultContainer = btn.closest('.result-card').querySelector('.execution-result');
+            if (!resultContainer) {
+                resultContainer = document.createElement('div');
+                resultContainer.className = 'execution-result';
+                btn.closest('.result-card').appendChild(resultContainer);
+            }
+
+            resultContainer.className = 'execution-result show info';
+            resultContainer.innerHTML = '<div style="text-align: center; padding: 20px;"><span class="spinner"></span> 正在执行...</div>';
+            resultContainer.style.display = 'block';
+
+            try {
+                const response = await fetch('http://127.0.0.1:8000/api/v1/execute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code: codeToRun })
+                });
+                const result = await response.json();
+
+                if (result.success) {
+                    resultContainer.className = 'execution-result show success';
+                    resultContainer.innerHTML = `
+                        <div style="margin-bottom: 8px;">✅ 执行成功</div>
+                        <div class="execution-output">${escapeHtml(result.output || '无输出')}</div>
+                        <div class="execution-time">⏱️ 执行时间: ${result.execution_time}秒</div>
+                    `;
+                } else {
+                    resultContainer.className = 'execution-result show error';
+                    resultContainer.innerHTML = `
+                        <div style="margin-bottom: 8px;">❌ 执行失败</div>
+                        <div class="execution-output">${escapeHtml(result.error || result.output || '未知错误')}</div>
+                        <div class="execution-time">⏱️ 执行时间: ${result.execution_time}秒</div>
+                    `;
+                }
+            } catch (error) {
+                resultContainer.className = 'execution-result show error';
+                resultContainer.innerHTML = `
+                    <div style="margin-bottom: 8px;">❌ 执行失败</div>
+                    <div class="execution-output">${escapeHtml(error.message)}</div>
+                `;
+            }
+
+            btn.textContent = originalText;
+            btn.disabled = false;
+        }
+
+        function removeEmptyState() {
+            const empty = document.getElementById('empty-state');
+            if (empty) empty.remove();
+        }
+
+        function addResultCard(id, icon, title, type, content, actions) {
+            removeEmptyState();
+            let card = document.getElementById(id);
+            if (card) card.remove();
+
+            card = document.createElement('div');
+            card.id = id;
+            card.className = `result-card ${type}`;
+
+            let actionsHtml = '';
+            if (actions && actions.length > 0) {
+                actionsHtml = '<div class="card-actions">' + actions.map(a =>
+                    `<button class="btn-small ${a.class || ''}" data-code64="${encodeCodePayload(a.code || '')}" onclick="${a.onclick}">${a.label}</button>`
+                ).join('') + '</div>';
+            }
+
+            card.innerHTML = `
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="card-title-icon">${icon}</span>
+                        <span>${title}</span>
+                    </div>
+                    ${actionsHtml}
+                </div>
+                <div class="card-body">${content}</div>
+            `;
+
+            document.getElementById('results-container').appendChild(card);
+        }
+
+        function renderTaskPlan(taskPlan) {
+            if (!taskPlan) return '<div style="color: var(--text-secondary);">暂无任务规划</div>';
+
+            let html = '<div class="task-plan-box">';
+            if (taskPlan.task) {
+                html += `<div class="plan-main-task">📌 <strong>主任务：</strong>${escapeHtml(taskPlan.task)}</div>`;
+            }
+
+            const subTasks = taskPlan.sub_tasks || [];
+            if (subTasks.length > 0) {
+                html += '<div class="plan-subtasks">';
+                subTasks.forEach((sub, idx) => {
+                    const complexity = sub.complexity || 'low';
+                    html += `
+                        <div class="subtask-item complexity-${complexity}">
+                            <span class="subtask-id">#${sub.id || idx + 1}</span>
+                            <div>
+                                <div class="subtask-desc">${escapeHtml(sub.description || '')}</div>
+                                ${sub.dependencies && sub.dependencies.length > 0
+                                    ? `<div class="subtask-deps">依赖: #${sub.dependencies.join(', #')}</div>`
+                                    : ''}
+                            </div>
+                        </div>
+                    `;
+                });
+                html += '</div>';
+            }
+
+            html += '</div>';
+            return html;
+        }
+
+        function renderReviewResult(reviewResult) {
+            if (!reviewResult) return '';
+            let html = '<div>';
+
+            html += '<div class="review-summary">';
+            if (reviewResult.score) {
+                html += `<span class="review-score">⭐ ${reviewResult.score}/10</span>`;
+            }
+            if (reviewResult.needs_revision) {
+                html += `<span class="review-verdict fail">⚠️ 审查未通过</span>`;
+            } else {
+                html += `<span class="review-verdict pass">✅ 审查通过</span>`;
+            }
+            html += '</div>';
+
+            if (reviewResult.summary) {
+                html += `<div style="margin-top: 10px; color: var(--text-secondary);">${escapeHtml(reviewResult.summary)}</div>`;
+            }
+
+            const issues = reviewResult.issues || [];
+            if (issues.length > 0) {
+                html += '<div class="review-issues">';
+                issues.forEach(issue => {
+                    const severity = issue.severity || 'warning';
+                    html += `
+                        <div class="issue-item ${severity}">
+                            <div class="issue-header">
+                                <span class="issue-badge ${severity}">${severity.toUpperCase()}</span>
+                            </div>
+                            <div class="issue-desc">${escapeHtml(issue.description || '')}</div>
+                            ${issue.suggestion ? `<div class="issue-suggestion">💡 建议：${escapeHtml(issue.suggestion)}</div>` : ''}
+                        </div>
+                    `;
+                });
+                html += '</div>';
+            }
+
+            html += '</div>';
+            return html;
+        }
+
+        function addLogEntry(agent, message, status) {
+            const logContainer = document.getElementById('agent-log');
+            logContainer.style.display = 'block';
+
+            const recent = logContainer.lastElementChild;
+            const key = `${agent}|${message}|${status || ''}`;
+            if (recent && recent.dataset && recent.dataset.key === key) {
+                return;
+            }
+
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${status || ''}`;
+            entry.dataset.key = key;
+
+            const now = new Date();
+            const time = now.toLocaleTimeString('zh-CN', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+
+            entry.innerHTML = `
+                <span class="log-time">${time}</span>
+                <span class="log-agent ${agentNames[agent] || agent}">${agent}</span>
+                <span class="log-message">${escapeHtml(message)}</span>
+            `;
+
+            logContainer.appendChild(entry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        async function generateCode() {
+            const taskInput = document.getElementById('task-input').value.trim();
+            if (!taskInput) {
+                showStatus('⚠️ 请输入任务描述', 'error');
+                return;
+            }
+
+            resetPipeline();
+            setLoading(true);
+            showProgress(true);
+            setProgress(5);
+            showStatus('🚀 正在启动多Agent流水线...', 'info');
+
+            document.getElementById('results-container').innerHTML = '';
+            document.getElementById('agent-log').style.display = 'none';
+            updatePipelineStep('plan', 'active', '进行中');
+
+            addResultCard(
+                'card-plan',
+                '📋',
+                '任务规划',
+                'default',
+                '<div style="text-align: center; padding: 28px;"><span class="spinner"></span> 正在分析任务...</div>',
+                null
+            );
+
+            let flowFinished = false;
+            let currentLoopState = 'idle';
+
+            try {
+                const response = await fetch('http://127.0.0.1:8000/api/v1/generate/stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        task_description: taskInput,
+                        session_id: `session_${Date.now()}`
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+
+                        try {
+                            const data = JSON.parse(line.slice(6));
+
+                            if (data.type === 'progress') {
+                                const step = data.step;
+                                const status = data.status === 'running' ? 'active' : data.status;
+                                const description = data.description || '';
+                                const stepData = data.data || {};
+
+                                updatePipelineStep(
+                                    step,
+                                    status,
+                                    status === 'active' ? '进行中' : status === 'completed' ? '已完成' : '失败'
+                                );
+                                setProgress(stepProgress[step] || 10);
+
+                                if (step === 'review' && status === 'active') {
+                                    updateReviewLoopVisual('reviewing');
+                                    currentLoopState = 'reviewing';
+                                }
+                                if (step === 'review' && stepData.review) {
+                                    if (stepData.review.needs_revision) {
+                                        updateReviewLoopVisual('looping');
+                                        currentLoopState = 'looping';
+                                        addLogEntry('system', '审查未通过，进入“修正→再审查”循环', 'error');
+                                    } else {
+                                        updateReviewLoopVisual('passed');
+                                        currentLoopState = 'passed';
+                                        addLogEntry('system', '审查通过，流程可结束', 'completed');
+                                    }
+                                }
+                                if (step === 'fix' && status === 'completed') {
+                                    updateReviewLoopVisual('awaiting_recheck');
+                                    currentLoopState = 'awaiting_recheck';
+                                }
+
+                                if (status === 'active') {
+                                    addLogEntry(step, description, '');
+                                } else if (status === 'completed') {
+                                    addLogEntry(step, description, 'completed');
+                                } else if (status === 'error') {
+                                    addLogEntry(step, description, 'error');
+                                }
+
+                                if (step === 'plan' && stepData.task_plan) {
+                                    addResultCard('card-plan', '📋', '任务规划', 'success', renderTaskPlan(stepData.task_plan), null);
+                                }
+
+                                if (step === 'generate' && stepData.code) {
+                                    const code = stepData.code;
+                                    addResultCard(
+                                        'card-generate',
+                                        '💻',
+                                        '生成的代码',
+                                        'success',
+                                        `<div class="code-block">${escapeHtml(code)}</div>`,
+                                        [
+                                            { label: '📋 复制', class: 'primary', onclick: 'copyToClipboard(decodeCodePayload(this.dataset.code64))', code: code },
+                                            { label: '▶ 运行', class: 'success', onclick: 'executeCode(this, decodeCodePayload(this.dataset.code64))', code: code }
+                                        ]
+                                    );
+                                }
+
+                                if (step === 'review' && stepData.review) {
+                                    const reviewType = stepData.review.needs_revision ? 'warning' : 'success';
+                                    addResultCard('card-review', '🔍', '代码审查', reviewType, renderReviewResult(stepData.review), null);
+                                }
+
+                                if (step === 'fix' && stepData.fixed_code) {
+                                    const code = stepData.fixed_code;
+                                    addResultCard(
+                                        'card-fix',
+                                        '🔧',
+                                        '修正后的代码',
+                                        'success',
+                                        `<div class="code-block">${escapeHtml(code)}</div>`,
+                                        [
+                                            { label: '📋 复制', class: 'primary', onclick: 'copyToClipboard(decodeCodePayload(this.dataset.code64))', code: code },
+                                            { label: '▶ 运行', class: 'success', onclick: 'executeCode(this, decodeCodePayload(this.dataset.code64))', code: code }
+                                        ]
+                                    );
+                                }
+
+                                showStatus(description, status === 'completed' ? 'success' : 'info');
+                            } else if (data.type === 'complete') {
+                                flowFinished = true;
+                                setProgress(100);
+
+                                const result = data.result || {};
+                                const finalCode = result.final_code || result.generated_code || '';
+
+                                if (finalCode && !document.getElementById('card-generate')) {
+                                    addResultCard(
+                                        'card-generate',
+                                        '💻',
+                                        '生成的代码',
+                                        'success',
+                                        `<div class="code-block">${escapeHtml(finalCode)}</div>`,
+                                        [
+                                            { label: '📋 复制', class: 'primary', onclick: 'copyToClipboard(decodeCodePayload(this.dataset.code64))', code: finalCode },
+                                            { label: '▶ 运行', class: 'success', onclick: 'executeCode(this, decodeCodePayload(this.dataset.code64))', code: finalCode }
+                                        ]
+                                    );
+                                }
+
+                                if (result.review_result && !document.getElementById('card-review')) {
+                                    const reviewType = result.review_result.needs_revision ? 'warning' : 'success';
+                                    addResultCard('card-review', '🔍', '代码审查', reviewType, renderReviewResult(result.review_result), null);
+                                    if (result.review_result.needs_revision) {
+                                        updateReviewLoopVisual('looping');
+                                        currentLoopState = 'looping';
+                                    } else {
+                                        updateReviewLoopVisual('passed');
+                                        currentLoopState = 'passed';
+                                    }
+                                }
+
+                                if (result.task_plan && !document.getElementById('card-plan')) {
+                                    addResultCard('card-plan', '📋', '任务规划', 'success', renderTaskPlan(result.task_plan), null);
+                                }
+
+                                showStatus('✅ 多Agent流水线执行完成！', 'success');
+                                addLogEntry('system', '所有步骤执行完成', 'completed');
+                            } else if (data.type === 'error') {
+                                flowFinished = true;
+                                showStatus(`❌ 错误: ${data.error}`, 'error');
+                                updateReviewLoopVisual('error');
+                                stepIds.forEach(s => updatePipelineStep(s, 'error', '失败'));
+                                addLogEntry('system', `执行出错: ${data.error}`, 'error');
+
+                                if (!document.getElementById('card-generate')) {
+                                    addResultCard(
+                                        'card-error',
+                                        '❌',
+                                        '执行错误',
+                                        'error',
+                                        `<div style="color: var(--error);">${escapeHtml(data.error)}</div>`,
+                                        null
+                                    );
+                                }
+                            } else if (data.type === 'ping') {
+                                // Keepalive
+                            }
+                        } catch (e) {
+                            console.error('解析SSE数据失败:', e, line);
+                        }
+                    }
+                }
+
+                if (!flowFinished) {
+                    if (currentLoopState === 'reviewing') {
+                        updateReviewLoopVisual('awaiting_recheck');
+                        currentLoopState = 'awaiting_recheck';
+                    }
+                    showStatus('✅ 流式响应结束', 'success');
+                    addLogEntry('system', '流式响应已结束', 'completed');
+                }
+            } catch (error) {
+                showStatus(`❌ 连接失败: ${error.message}`, 'error');
+                updateReviewLoopVisual('error');
+                stepIds.forEach(s => updatePipelineStep(s, 'error', '失败'));
+                addLogEntry('system', `连接失败: ${error.message}`, 'error');
+            } finally {
+                showProgress(false);
+                setLoading(false);
+            }
+        }
+    </script>
+</body>
+</html>
