@@ -65,6 +65,30 @@ class SessionManager:
         self.redis_enabled = False
         self.sessions = {}
 
+        # Check if Redis is enabled via environment variable
+        use_redis = os.getenv("USE_REDIS", "false").lower() == "true"
+
+        if use_redis:
+            self._init_redis()
+        else:
+            # Check if Redis is available even when not forced
+            self._try_init_redis()
+
+    def _init_redis(self):
+        """Initialize Redis connection"""
+        try:
+            redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+            import redis
+            self.redis_client = redis.from_url(redis_url)
+            self.redis_client.ping()
+            self.redis_enabled = True
+            print("Session manager: Using Redis storage")
+        except Exception as e:
+            print(f"Redis initialization failed: {e}, using in-memory session storage")
+            self.redis_enabled = False
+
+    def _try_init_redis(self):
+        """Try to initialize Redis if available"""
         try:
             redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
             import redis

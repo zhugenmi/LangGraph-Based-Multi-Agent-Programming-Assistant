@@ -8,13 +8,19 @@ from pathlib import Path
 import ast
 from src.llm.llm_model_client import get_agent_llm_client
 from src.skills.skill_registry import skill_registry
+from src.utils.helpers import build_prompt, safe_parse
+from src.utils.prompts import (
+    REPO_ANALYST_CLASSIFY_PROMPT,
+    REPO_ANALYST_NEW_PROJECT_PROMPT,
+    REPO_ANALYST_MODIFICATION_PROMPT,
+)
 
 
 class TaskType:
     """Task types"""
-    MODIFY_EXISTING = "modify_existing"  # Modify existing code
-    CREATE_NEW = "create_new"  # Create new project/files
-    MIXED = "mixed"  # Both modify and create
+    MODIFY_EXISTING = "modify_existing"
+    CREATE_NEW = "create_new"
+    MIXED = "mixed"
 
 
 class RepoAnalystAgent:
@@ -22,7 +28,7 @@ class RepoAnalystAgent:
 
     def __init__(self):
         self.client = get_agent_llm_client("repo_analyst")
-        self.model = "bigmodel"
+        self.model = "repo_analyst"
         self.project_root = Path(__file__).parent.parent.parent
         self.skills = skill_registry.get_skills_for_agent("repo_analyst")
 
@@ -35,42 +41,13 @@ class RepoAnalystAgent:
             raise ValueError(f"Skill '{skill_name}' not available")
 
     def classify_task(self, task_description: str) -> Dict[str, Any]:
-        """
-        Classify the task type based on the description.
-
-        Args:
-            task_description: The task description
-
-        Returns:
-            Dict containing task classification
-        """
-        prompt = f"""你是一个专业的任务分类器。请分析以下任务描述，判断任务类型。
-
-任务描述：{task_description}
-
-请判断这是哪种类型的任务：
-1. modify_existing - 修改已有的代码/文件
-2. create_new - 创建新的项目或全新文件
-3. mixed - 既需要修改已有代码，也需要创建新文件
-
-关键指标：
-- 如果是"修改"、"修复"、"优化"、"添加功能到已有文件" -> modify_existing
-- 如果是"创建新项目"、"从头开始"、"新建一个" -> create_new
-- 如果两者都有 -> mixed
-
-请按以下 JSON 格式输出（只输出 JSON）：
-{{
-    "task_type": "modify_existing|create_new|mixed",
-    "confidence": 0.0-1.0,
-    "reasoning": "判断理由",
-    "existing_files_mentioned": ["可能涉及的文件"],
-    "new_files_needed": ["可能需要创建的新文件"],
-    "suggested_project_type": "如果是新项目，建议的项目类型（python_package/fastapi_project 等）"
-}}
-"""
+        """Classify the task type based on the description."""
+        prompt = build_prompt(
+            REPO_ANALYST_CLASSIFY_PROMPT,
+            task_description=task_description,
+        )
         try:
             response = self.client.invoke(prompt)
-
             if hasattr(response, 'content'):
                 content = response.content
             elif hasattr(response, 'text'):
@@ -78,14 +55,15 @@ class RepoAnalystAgent:
             else:
                 content = str(response)
 
-            # Extract JSON
-            json_match = re.search(r'\{[\s\S]*\}', content)
-            if json_match:
-                return json.loads(json_match.group())
+            try:
+                result = safe_parse(content)
+                if "task_type" in result:
+                    return result
+            except ValueError:
+                pass
         except Exception as e:
             print(f"Task classification error: {e}")
 
-        # Default to modify_existing
         return {
             "task_type": TaskType.MODIFY_EXISTING,
             "confidence": 0.5,
@@ -96,26 +74,15 @@ class RepoAnalystAgent:
         }
 
     def analyze(self, task_description: str) -> Dict[str, Any]:
-        """
-        Analyze the codebase to understand context and identify relevant files.
-        Routes to different analysis methods based on task type.
-
-        Args:
-            task_description: The coding task description
-
-        Returns:
-            Dict containing repository analysis results
-        """
-        # First, classify the task type
+        """Analyze the codebase to understand context and identify relevant files."""
         task_classification = self.classify_task(task_description)
         task_type = task_classification.get("task_type", TaskType.MODIFY_EXISTING)
 
-        # Route to appropriate analysis method
         if task_type == TaskType.CREATE_NEW:
             return self._analyze_new_project_task(task_description, task_classification)
         elif task_type == TaskType.MODIFY_EXISTING:
             return self._analyze_modification_task(task_description, task_classification)
-        else:  # mixed
+        else:
             return self._analyze_mixed_task(task_description, task_classification)
 
     def _analyze_new_project_task(
@@ -123,52 +90,16 @@ class RepoAnalystAgent:
         task_description: str,
         task_classification: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """
-        Analyze a task that requires creating a new project.
-
-        Args:
-            task_description: The task description
-            task_classification: The task classification result
-
-        Returns:
-            Dict containing new project analysis
-        """
+        """Analyze a task that requires creating a new project."""
         project_type = task_classification.get("suggested_project_type", "python_package")
 
-        # Use LLM to generate detailed project plan
-        prompt = f"""你是一个资深的项目架构师。用户需要创建一个新项目，请根据任务描述生成详细的项目规划。
-
-任务描述：{task_description}
-建议的项目类型：{project_type}
-
-请按以下 JSON 格式输出（只输出 JSON）：
-{{
-    "project_name": "建议的项目名称",
-    "project_type": "python_package|fastapi_project|flask_project|cli_tool|data_science|langgraph_agent",
-    "description": "项目描述",
-    "directory_structure": {{
-        "project_name/": "主目录",
-        "project_name/__init__.py": "包初始化",
-        "project_name/main.py": "入口文件",
-        "tests/": "测试目录"
-    }},
-    "core_files": [
-        {{
-            "path": "文件路径",
-            "purpose": "文件用途",
-            "key_components": ["主要组件 1", "主要组件 2"]
-        }}
-    ],
-    "dependencies": ["依赖 1", "依赖 2"],
-    "setup_steps": ["步骤 1", "步骤 2"],
-    "test_strategy": "测试策略",
-    "estimated_complexity": "low/medium/high",
-    "estimated_hours": 数字
-}}
-"""
+        prompt = build_prompt(
+            REPO_ANALYST_NEW_PROJECT_PROMPT,
+            task_description=task_description,
+            project_type=project_type,
+        )
         try:
             response = self.client.invoke(prompt)
-
             if hasattr(response, 'content'):
                 content = response.content
             elif hasattr(response, 'text'):
@@ -176,25 +107,23 @@ class RepoAnalystAgent:
             else:
                 content = str(response)
 
-            # Extract JSON
-            json_match = re.search(r'\{[\s\S]*\}', content)
-            if json_match:
-                project_plan = json.loads(json_match.group())
+            try:
+                project_plan = safe_parse(content)
+            except ValueError:
+                project_plan = None
 
-                # Use scaffold skill to create the project
+            if project_plan:
                 scaffold_result = self._create_project_scaffold(
                     project_plan.get("project_name", "new_project"),
                     project_plan.get("project_type", "python_package"),
                     task_description
                 )
-
                 project_plan["scaffold_result"] = scaffold_result
                 project_plan["task_type"] = TaskType.CREATE_NEW
                 return project_plan
         except Exception as e:
             print(f"New project analysis error: {e}")
 
-        # Default response
         return {
             "task_type": TaskType.CREATE_NEW,
             "project_name": "new_project",
@@ -212,23 +141,12 @@ class RepoAnalystAgent:
         task_description: str,
         task_classification: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """
-        Analyze a task that requires modifying existing code.
-
-        Args:
-            task_description: The task description
-            task_classification: The task classification result
-
-        Returns:
-            Dict containing modification analysis
-        """
-        # Analyze current project structure
+        """Analyze a task that requires modifying existing code."""
         project_structure = self._analyze_project_structure()
         language_info = self._identify_language()
         dependencies = self._analyze_dependencies()
         test_info = self._find_test_information()
 
-        # Use file search skill to find relevant files
         relevant_files = []
         try:
             search_result = self.use_skill("file_search", task_description, ".", "python")
@@ -237,89 +155,47 @@ class RepoAnalystAgent:
         except Exception as e:
             print(f"File search error: {e}")
 
-        # Use LLM to generate modification plan
-        prompt = f"""你是一个资深的代码分析师。基于以下项目信息和任务，请分析需要修改的文件和修改方案。
-
-项目信息：
-- 项目结构：{json.dumps(project_structure, ensure_ascii=False, indent=2)}
-- 编程语言：{language_info['language']} ({language_info['framework'] or '无框架'})
-- 主要依赖：{dependencies}
-- 测试信息：{test_info}
-- 相关文件：{relevant_files}
-
-任务描述：{task_description}
-
-请按以下 JSON 格式输出分析结果（只输出 JSON）：
-{{
-    "task_type": "modify_existing",
-    "main_files_to_modify": ["需要修改的主要文件路径"],
-    "related_files": ["相关文件路径"],
-    "modification_plan": [
-        {{
-            "file": "文件路径",
-            "changes": ["变更 1", "变更 2"],
-            "risk_level": "low/medium/high"
-        }}
-    ],
-    "dependencies_to_update": ["需要更新的依赖"],
-    "test_files_to_update": ["需要更新的测试文件"],
-    "key_patterns": {{
-        "imports": ["需要导入的模块"],
-        "classes_to_modify": ["需要修改的类"],
-        "functions_to_modify": ["需要修改的函数"]
-    }},
-    "risk_points": ["风险点 1", "风险点 2"],
-    "suggestions": ["建议 1", "建议 2"],
-    "complexity_assessment": "low/medium/high",
-    "estimated_hours": 数字
-}}
-
-分析要点：
-1. 找出需要修改的核心文件
-2. 评估修改的影响范围
-3. 识别潜在风险点
-4. 评估任务复杂度"""
+        prompt = build_prompt(
+            REPO_ANALYST_MODIFICATION_PROMPT,
+            project_structure=project_structure,
+            language=language_info,
+            dependencies=dependencies,
+            test_info=test_info,
+            relevant_files=relevant_files,
+            task_description=task_description,
+        )
 
         try:
             response = self.client.invoke(prompt)
-
             if hasattr(response, 'content'):
-                return self._parse_analysis_response(response.content, project_structure)
+                content = response.content
             elif hasattr(response, 'text'):
-                return self._parse_analysis_response(response.text, project_structure)
-            elif isinstance(response, str):
-                return self._parse_analysis_response(response, project_structure)
+                content = response.text
             else:
-                return self._create_default_analysis(project_structure, TaskType.MODIFY_EXISTING)
+                content = str(response)
 
+            try:
+                analysis = safe_parse(content)
+                return self._ensure_required_fields(analysis)
+            except ValueError:
+                pass
         except Exception as e:
             print(f"Modification analysis error: {e}")
-            return self._create_default_analysis(project_structure, TaskType.MODIFY_EXISTING)
+
+        return self._create_default_analysis(project_structure, TaskType.MODIFY_EXISTING)
 
     def _analyze_mixed_task(
         self,
         task_description: str,
         task_classification: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """
-        Analyze a task that requires both modification and creation.
-
-        Args:
-            task_description: The task description
-            task_classification: The task classification result
-
-        Returns:
-            Dict containing mixed task analysis
-        """
-        # Combine both analyses
+        """Analyze a task that requires both modification and creation."""
         modification_analysis = self._analyze_modification_task(
             task_description,
             task_classification
         )
 
-        # Add creation-specific information
         new_files = task_classification.get("new_files_needed", [])
-
         modification_analysis["task_type"] = TaskType.MIXED
         modification_analysis["new_files_to_create"] = new_files
         modification_analysis["creation_plan"] = [
@@ -339,17 +215,7 @@ class RepoAnalystAgent:
         project_type: str,
         task_description: str
     ) -> Dict[str, Any]:
-        """
-        Create project scaffold using the scaffold skill.
-
-        Args:
-            project_name: Name of the project
-            project_type: Type of project
-            task_description: Task description for custom config
-
-        Returns:
-            Result from scaffold execution
-        """
+        """Create project scaffold using the scaffold skill."""
         try:
             scaffold_skill = skill_registry.get_skill("project_scaffold")
             if scaffold_skill:
@@ -428,7 +294,6 @@ class RepoAnalystAgent:
         package_json = {}
         if (self.project_root / "package.json").exists():
             try:
-                import json
                 package_json = json.loads((self.project_root / "package.json").read_text())
             except:
                 pass
@@ -506,59 +371,6 @@ class RepoAnalystAgent:
             test_info["test_commands"].append("python -m unittest")
 
         return test_info
-
-    def _extract_key_patterns(self) -> Dict[str, List[str]]:
-        """Extract key patterns from the codebase"""
-        patterns = {
-            "imports": [],
-            "class_patterns": [],
-            "function_patterns": []
-        }
-
-        relevant_files = self._find_relevant_files("", {})
-        for file_path in relevant_files[:5]:
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-
-                imports = re.findall(r'from\s+([^\s]+)\s+import|import\s+([^\s]+)', content)
-                for imp in imports:
-                    if imp[0]:
-                        patterns["imports"].append(imp[0])
-                    elif imp[1]:
-                        patterns["imports"].append(imp[1])
-
-                classes = re.findall(r'class\s+(\w+)', content)
-                patterns["class_patterns"].extend(classes)
-
-                functions = re.findall(r'def\s+(\w+)', content)
-                patterns["function_patterns"].extend(functions)
-
-            except Exception as e:
-                print(f"Error reading {file_path}: {e}")
-                continue
-
-        for key in patterns:
-            patterns[key] = list(set(patterns[key]))
-
-        return patterns
-
-    def _parse_analysis_response(self, response: str, project_structure: Dict) -> Dict[str, Any]:
-        """Parse LLM response into structured analysis"""
-        import json
-        import re
-
-        response = response.strip()
-
-        json_match = re.search(r'\{[\s\S]*\}', response)
-        if json_match:
-            try:
-                analysis = json.loads(json_match.group())
-                return self._ensure_required_fields(analysis)
-            except json.JSONDecodeError:
-                pass
-
-        return self._create_default_analysis(project_structure, TaskType.MODIFY_EXISTING)
 
     def _ensure_required_fields(self, analysis: Dict) -> Dict[str, Any]:
         """Ensure all required fields exist in analysis"""

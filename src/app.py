@@ -50,6 +50,10 @@ workflow_progress_store = {}
 
 def create_app():
     """Create and configure the Flask application"""
+    # Ensure required directories exist
+    for d in ["outputs", "memory_store", "logs"]:
+        (PROJECT_ROOT / d).mkdir(parents=True, exist_ok=True)
+
     app = Flask(__name__, template_folder=os.path.join(PROJECT_ROOT, 'templates'))
     CORS(app)
 
@@ -68,15 +72,60 @@ def create_app():
             if not task_description:
                 return jsonify({"error": "任务描述不能为空"}), 400
 
-            from src.graph.workflow import create_workflow
+            from src.graph.workflow import create_workflow, format_workflow_result
+            from src.utils.logger import TaskTimer, metrics_registry
+            from src.utils.code_artifact_writer import save_generated_code
+
             workflow = create_workflow()
 
-            result = workflow.invoke({
-                "task_description": task_description,
-                "session_id": session_id
-            })
+            with TaskTimer(session_id, session_id, task_description) as timer:
+                result = workflow.invoke({
+                    "task_description": task_description,
+                    "session_id": session_id,
+                    "max_iterations": 3,
+                })
+                timer.iterations = result.get("iteration_count", 0)
+                # Count fix rounds
+                fix_steps = [s for s in result.get("workflow_steps", []) if s.get("step_name") == "implementer"]
+                timer.fix_rounds = max(0, len(fix_steps) - 1)
 
-            return jsonify({"result": result, "session_id": session_id}), 200
+            # Save generated code to artifacts
+            formatted_result = format_workflow_result(result)
+            final_code = formatted_result.get("final_code") or formatted_result.get("generated_code")
+            if final_code:
+                task_plan = formatted_result.get("task_plan", {})
+                language = task_plan.get("language", "python") if task_plan else "python"
+
+                # Get metrics for this task
+                task_metrics = metrics_registry.get_task(session_id)
+                metrics_dict = task_metrics.to_dict() if task_metrics else {}
+
+                metadata = {
+                    "task_id": session_id,
+                    "language": language,
+                    "task_description": task_description,
+                    "task_plan": task_plan,
+                    "metrics": {
+                        "total_duration_s": metrics_dict.get("total_duration_s", 0),
+                        "llm_calls_count": len(metrics_dict.get("llm_calls", [])),
+                        "total_tokens": sum(m.get("total_tokens", 0) for m in metrics_dict.get("llm_calls", [])),
+                        "iterations": metrics_dict.get("iterations", 0),
+                        "fix_rounds": timer.fix_rounds,
+                    } if metrics_dict else {}
+                }
+
+                save_path = save_generated_code(
+                    task_id=session_id,
+                    code=final_code,
+                    language=language,
+                    metadata=metadata
+                )
+                formatted_result["artifact_path"] = str(save_path)
+
+            return jsonify({
+                "result": formatted_result,
+                "session_id": session_id,
+            }), 200
 
         except Exception as e:
             import traceback
@@ -97,19 +146,61 @@ def create_app():
 
         def run_workflow():
             try:
-                from src.graph.workflow import create_workflow
-
-                workflow = create_workflow()
+                from src.graph.workflow import create_workflow, format_workflow_result
+                from src.utils.logger import TaskTimer, metrics_registry
+                from src.utils.code_artifact_writer import save_generated_code
 
                 progress.add_step('plan', '📋 任务规划 Agent 正在分析任务...', 'running')
 
-                result = workflow.invoke(
-                    {
-                        "task_description": task_description,
-                        "session_id": session_id,
-                        "progress_callback": progress
-                    }
-                )
+                workflow = create_workflow()
+
+                with TaskTimer(session_id, session_id, task_description) as timer:
+                    result = workflow.invoke(
+                        {
+                            "task_description": task_description,
+                            "session_id": session_id,
+                            "max_iterations": 3,
+                            "progress_callback": progress
+                        }
+                    )
+                    timer.iterations = result.get("iteration_count", 0)
+                    fix_steps = [s for s in result.get("workflow_steps", []) if s.get("step_name") == "implementer"]
+                    timer.fix_rounds = max(0, len(fix_steps) - 1)
+
+                # Save generated code to artifacts (in thread context)
+                formatted_result = format_workflow_result(result)
+                final_code = formatted_result.get("final_code") or formatted_result.get("generated_code")
+                if final_code and final_code.strip():
+                    try:
+                        task_plan = formatted_result.get("task_plan", {})
+                        language = task_plan.get("language", "python") if task_plan else "python"
+
+                        task_metrics = metrics_registry.get_task(session_id)
+                        metrics_dict = task_metrics.to_dict() if task_metrics else {}
+
+                        metadata = {
+                            "task_id": session_id,
+                            "language": language,
+                            "task_description": task_description,
+                            "task_plan": task_plan,
+                            "metrics": {
+                                "total_duration_s": metrics_dict.get("total_duration_s", 0),
+                                "llm_calls_count": len(metrics_dict.get("llm_calls", [])),
+                                "total_tokens": sum(m.get("total_tokens", 0) for m in metrics_dict.get("llm_calls", [])),
+                                "iterations": metrics_dict.get("iterations", 0),
+                                "fix_rounds": timer.fix_rounds,
+                            } if metrics_dict else {}
+                        }
+
+                        save_path = save_generated_code(
+                            task_id=session_id,
+                            code=final_code,
+                            language=language,
+                            metadata=metadata
+                        )
+                        formatted_result["artifact_path"] = str(save_path)
+                    except Exception as save_err:
+                        print(f"Warning: Failed to save artifact: {save_err}")
 
                 progress.complete(result)
 
@@ -200,7 +291,7 @@ def create_app():
             # Try to get context from RAG
             try:
                 from src.rag.code_rag import create_code_rag
-                rag = create_code_rag(repo_path=str(PROJECT_ROOT), use_local_embedding=True)
+                rag = create_code_rag(repo_path=str(PROJECT_ROOT), use_local_embedding=True, incremental=True)
                 rag_context = rag.get_context_for_query(message, max_tokens=1000)
                 context_text += rag_context
             except Exception as e:
@@ -278,6 +369,13 @@ def create_app():
                 "conversation_turns": st.get("conversation_turns", 0),
                 "task_states": st.get("task_states", 0)
             }), 200
+        except FileNotFoundError:
+            return jsonify({
+                "session_id": session_id,
+                "conversation_turns": 0,
+                "task_states": 0,
+                "message": "会话无记忆数据"
+            }), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
@@ -309,21 +407,54 @@ def create_app():
     def get_rag_stats():
         """Get RAG index statistics"""
         try:
-            from src.rag.code_rag import create_code_rag
-            rag = create_code_rag(repo_path=str(PROJECT_ROOT), use_local_embedding=True)
+            from src.rag.code_rag import create_code_rag, get_rag_config, CodeRAG
+            # Try loading existing index first (no embedding needed)
+            rag = CodeRAG(repo_path=str(PROJECT_ROOT), use_local_embedding=False)
             stats = rag.get_stats()
-
+            stats["config"] = get_rag_config()
             return jsonify(stats), 200
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "ollama" in err_msg or "embedding" in err_msg:
+                return jsonify({
+                    "error": "Embedding 服务不可用",
+                    "detail": str(e),
+                    "solution": "启动 Ollama 服务或配置云端 embedding API"
+                }), 200
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/v1/rag/config", methods=["GET"])
+    def get_rag_config_api():
+        """Get RAG configuration"""
+        try:
+            from src.rag.code_rag import get_rag_config
+            config = get_rag_config()
+            return jsonify(config), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/v1/rag/build", methods=["POST"])
     def build_rag_index():
-        """Build or rebuild RAG index"""
+        """Build or rebuild RAG index (full rebuild)"""
         try:
             from src.rag.code_rag import CodeRAG
             rag = CodeRAG(repo_path=str(PROJECT_ROOT))
             result = rag.build_index()
+
+            return jsonify(result), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/v1/rag/update", methods=["POST"])
+    def update_rag_index():
+        """Incrementally update RAG index (only changed files)"""
+        try:
+            data = request.json or {}
+            rebuild_threshold = data.get("rebuild_threshold", 50)
+
+            from src.rag.code_rag import CodeRAG
+            rag = CodeRAG(repo_path=str(PROJECT_ROOT))
+            result = rag.incremental_update(rebuild_threshold=rebuild_threshold)
 
             return jsonify(result), 200
         except Exception as e:
@@ -344,6 +475,40 @@ def create_app():
         session_manager = SessionManager()
         session_manager.delete_session(session_id)
         return jsonify({"message": "会话删除成功"}), 200
+
+    @app.route("/api/v1/metrics", methods=["GET"])
+    def get_metrics():
+        """Get all task metrics"""
+        try:
+            from src.utils.logger import metrics_registry
+            all_metrics = metrics_registry.get_all_summary()
+            return jsonify({"metrics": all_metrics, "count": len(all_metrics)}), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/v1/metrics/<task_id>", methods=["GET"])
+    def get_task_metrics(task_id):
+        """Get metrics for a specific task"""
+        try:
+            from src.utils.logger import metrics_registry
+            task = metrics_registry.get_task(task_id)
+            if task:
+                return jsonify(task.to_dict()), 200
+            return jsonify({"error": "Task not found"}), 404
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/v1/metrics/export", methods=["POST"])
+    def export_metrics():
+        """Export metrics to JSON file"""
+        try:
+            data = request.json or {}
+            output_dir = data.get("output_dir")
+            from src.utils.logger import export_metrics_report
+            report_path = export_metrics_report(output_dir)
+            return jsonify({"report_path": report_path}), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     return app
 

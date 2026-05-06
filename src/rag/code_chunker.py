@@ -2,9 +2,13 @@
 
 import os
 import ast
+import hashlib
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
+
+from pathspec import PathSpec
+from pathspec.patterns import GitWildMatchPattern
 
 
 class CodeChunker:
@@ -24,7 +28,8 @@ class CodeChunker:
         self,
         chunk_size: int = None,
         overlap: int = None,
-        language: str = "python"
+        language: str = "python",
+        repo_path: str = "."
     ):
         """Initialize code chunker
 
@@ -32,10 +37,29 @@ class CodeChunker:
             chunk_size: Maximum chunk size in characters
             overlap: Overlap between chunks
             language: Primary language for chunking
+            repo_path: Repository root path (for .gitignore)
         """
         self.chunk_size = chunk_size or self.DEFAULT_CHUNK_SIZE
         self.overlap = overlap or self.DEFAULT_OVERLAP
         self.language = language
+        self._gitignore_spec = self._load_gitignore(repo_path)
+
+    @staticmethod
+    def _load_gitignore(repo_path: str):
+        """Load .gitignore patterns from repo root"""
+        gitignore = Path(repo_path) / ".gitignore"
+        if gitignore.exists():
+            try:
+                return PathSpec.from_lines(GitWildMatchPattern, gitignore.read_text().splitlines())
+            except Exception:
+                pass
+        return None
+
+    def _is_ignored(self, rel_path: str) -> bool:
+        """Check if a relative file path matches .gitignore patterns"""
+        if self._gitignore_spec is None:
+            return False
+        return self._gitignore_spec.match_file(rel_path)
 
     def chunk_file(self, file_path: str) -> List[Dict[str, Any]]:
         """Chunk a file into semantic units
@@ -82,7 +106,7 @@ class CodeChunker:
         extensions: Optional[List[str]] = None,
         exclude_dirs: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
-        """Chunk all files in a directory
+        """Chunk all files in a directory, skipping .gitignore'd files
 
         Args:
             directory: Directory path
@@ -92,24 +116,27 @@ class CodeChunker:
         Returns:
             List of all chunks
         """
-        directory = Path(directory)
+        directory = Path(directory).resolve()
         if not directory.exists():
             return []
 
-        extensions = extensions or ['.py', '.js', '.ts', '.jsx', '.tsx', '.md', '.txt']
+        extensions = extensions or ['.py', '.js', '.ts', '.jsx', '.tsx', '.md']
         exclude_dirs = exclude_dirs or ['.git', '__pycache__', 'node_modules', 'venv', '.venv']
 
         all_chunks = []
 
         for root, dirs, files in os.walk(directory):
-            # Filter out excluded directories
             dirs[:] = [d for d in dirs if d not in exclude_dirs]
 
             for file in files:
                 file_path = Path(root) / file
 
-                # Check extension
                 if file_path.suffix not in extensions:
+                    continue
+
+                # Skip gitignore'd files
+                rel_path = str(file_path.relative_to(directory))
+                if self._is_ignored(rel_path):
                     continue
 
                 chunks = self.chunk_file(str(file_path))
@@ -117,24 +144,176 @@ class CodeChunker:
 
         return all_chunks
 
+    @staticmethod
+    def compute_file_hash(file_path: str) -> Optional[str]:
+        """Compute SHA-256 hash of file content for change detection.
+
+        Args:
+            file_path: Path to the file
+
+        Returns:
+            Hex digest string, or None if file cannot be read
+        """
+        try:
+            h = hashlib.sha256()
+            with open(file_path, 'rb') as f:
+                while True:
+                    chunk = f.read(8192)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            return h.hexdigest()
+        except (OSError, IOError):
+            return None
+
+    def chunk_directory_with_hashes(
+        self,
+        directory: str,
+        extensions: Optional[List[str]] = None,
+        exclude_dirs: Optional[List[str]] = None
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+        """Chunk all files in a directory and return chunks with file hashes,
+        skipping .gitignore'd files.
+
+        Args:
+            directory: Directory path
+            extensions: File extensions to include
+            exclude_dirs: Directories to exclude
+
+        Returns:
+            Tuple of (all chunks, file_path -> content_hash mapping)
+        """
+        directory = Path(directory).resolve()
+        if not directory.exists():
+            return [], {}
+
+        extensions = extensions or ['.py', '.js', '.ts', '.jsx', '.tsx', '.md']
+        exclude_dirs = exclude_dirs or ['.git', '__pycache__', 'node_modules', 'venv', '.venv']
+
+        all_chunks = []
+        file_hashes = {}
+
+        for root, dirs, files in os.walk(directory):
+            dirs[:] = [d for d in dirs if d not in exclude_dirs]
+
+            for file in files:
+                file_path = Path(root) / file
+
+                if file_path.suffix not in extensions:
+                    continue
+
+                rel_path = str(file_path.relative_to(directory))
+                if self._is_ignored(rel_path):
+                    continue
+
+                file_str = str(file_path)
+                file_hash = self.compute_file_hash(file_str)
+                if file_hash is None:
+                    continue
+
+                file_hashes[file_str] = file_hash
+                chunks = self.chunk_file(file_str)
+                all_chunks.extend(chunks)
+
+        return all_chunks, file_hashes
+
     def _detect_language(self, file_path: Path) -> str:
         """Detect language from file extension"""
         ext = file_path.suffix.lower()
 
         language_map = {
+            # Python
             '.py': 'python',
+            '.pyw': 'python',
+
+            # JavaScript/TypeScript
             '.js': 'javascript',
-            '.ts': 'typescript',
             '.jsx': 'javascript',
+            '.ts': 'typescript',
             '.tsx': 'typescript',
+            '.mjs': 'javascript',
+            '.cjs': 'javascript',
+
+            # Java
+            '.java': 'java',
+
+            # C/C++
+            '.c': 'c',
+            '.cpp': 'c++',
+            '.cc': 'c++',
+            '.cxx': 'c++',
+            '.h': 'c',
+            '.hpp': 'c++',
+
+            # C#
+            '.cs': 'c#',
+
+            # Go
+            '.go': 'go',
+
+            # Rust
+            '.rs': 'rust',
+
+            # Ruby
+            '.rb': 'ruby',
+
+            # PHP
+            '.php': 'php',
+
+            # Swift
+            '.swift': 'swift',
+
+            # Kotlin
+            '.kt': 'kotlin',
+            '.kts': 'kotlin',
+
+            # Scala
+            '.scala': 'scala',
+
+            # Shell
+            '.sh': 'shell',
+            '.bash': 'shell',
+            '.zsh': 'shell',
+
+            # SQL
+            '.sql': 'sql',
+
+            # HTML/CSS
+            '.html': 'html',
+            '.htm': 'html',
+            '.css': 'css',
+            '.scss': 'css',
+            '.sass': 'css',
+            '.less': 'css',
+
+            # Vue
+            '.vue': 'vue',
+
+            # Dart
+            '.dart': 'dart',
+
+            # Markdown/Text
             '.md': 'markdown',
             '.mdown': 'markdown',
             '.markdown': 'markdown',
             '.txt': 'text',
+
+            # Config
             '.json': 'json',
             '.yaml': 'yaml',
             '.yml': 'yaml',
-            '.toml': 'toml'
+            '.toml': 'toml',
+            '.xml': 'xml',
+
+            # Lua
+            '.lua': 'lua',
+
+            # Haskell
+            '.hs': 'haskell',
+
+            # Perl
+            '.pl': 'perl',
+            '.pm': 'perl',
         }
 
         return language_map.get(ext, 'text')

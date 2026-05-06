@@ -53,3 +53,13 @@ logs/
 test*
 CLAUDE*
 docs/
+rag_index/
+memory_store/
+*.txt
+prompts.py
+start-services.sh
+outputs/
+
+# Generated benchmark artifacts
+tests/humaneval/samples.jsonl
+tests/humaneval/results.json

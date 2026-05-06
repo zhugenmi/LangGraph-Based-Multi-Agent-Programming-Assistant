@@ -1,7 +1,42 @@
 """Implementer agent for both code generation and fixing"""
 
+import re
 from typing import Dict, Any, Optional
 from src.llm.llm_model_client import get_agent_llm_client
+from src.utils.helpers import build_prompt
+from src.utils.prompts import (
+    IMPLEMENTER_GENERATE_PROMPT,
+    IMPLEMENTER_FIX_PROMPT,
+)
+
+
+# Language-specific configurations
+LANGUAGE_CONFIG = {
+    "python": {"extension": ".py", "comment": "#", "docstring": '"""Docstring"""', "code_block": "python"},
+    "javascript": {"extension": ".js", "comment": "//", "docstring": "/** Docstring */", "code_block": "javascript"},
+    "typescript": {"extension": ".ts", "comment": "//", "docstring": "/** Docstring */", "code_block": "typescript"},
+    "java": {"extension": ".java", "comment": "//", "docstring": "/** Docstring */", "code_block": "java"},
+    "c++": {"extension": ".cpp", "comment": "//", "docstring": "/** Docstring */", "code_block": "cpp"},
+    "c": {"extension": ".c", "comment": "//", "docstring": "/** Docstring */", "code_block": "c"},
+    "c#": {"extension": ".cs", "comment": "//", "docstring": "/// <summary>Docstring</summary>", "code_block": "csharp"},
+    "go": {"extension": ".go", "comment": "//", "docstring": "// Docstring", "code_block": "go"},
+    "rust": {"extension": ".rs", "comment": "//", "docstring": "/// Docstring", "code_block": "rust"},
+    "ruby": {"extension": ".rb", "comment": "#", "docstring": "=begin\nDocstring\n=end", "code_block": "ruby"},
+    "php": {"extension": ".php", "comment": "//", "docstring": "/** Docstring */", "code_block": "php"},
+    "swift": {"extension": ".swift", "comment": "//", "docstring": "/// Docstring", "code_block": "swift"},
+    "kotlin": {"extension": ".kt", "comment": "//", "docstring": "/** Docstring */", "code_block": "kotlin"},
+    "shell": {"extension": ".sh", "comment": "#", "docstring": "# Docstring", "code_block": "bash"},
+    "sql": {"extension": ".sql", "comment": "--", "docstring": "-- Docstring", "code_block": "sql"},
+    "html": {"extension": ".html", "comment": "<!-- -->", "docstring": "<!-- Docstring -->", "code_block": "html"},
+    "css": {"extension": ".css", "comment": "/* */", "docstring": "/* Docstring */", "code_block": "css"},
+    "vue": {"extension": ".vue", "comment": "<!-- -->", "docstring": "<!-- Docstring -->", "code_block": "html"},
+    "react": {"extension": ".jsx", "comment": "//", "docstring": "/** Docstring */", "code_block": "javascript"},
+}
+
+
+def get_language_config(language: str) -> Dict[str, str]:
+    """Get configuration for a specific language"""
+    return LANGUAGE_CONFIG.get(language.lower(), LANGUAGE_CONFIG["python"])
 
 
 class Implementer:
@@ -9,60 +44,46 @@ class Implementer:
 
     def __init__(self):
         self.client = get_agent_llm_client("implementer")
-        self.model = "bigmodel"
+        self.model = "implementer"
 
-    def generate(self, task_description: str, task_plan: Optional[Dict[str, Any]] = None, repo_analysis: Optional[Dict[str, Any]] = None) -> str:
-        """
-        Generate code based on task description and plan.
+    def generate(
+        self,
+        task_description: str,
+        task_plan: Optional[Dict[str, Any]] = None,
+        repo_analysis: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Generate code based on task description and plan."""
+        language = "python"
+        if task_plan and task_plan.get("language"):
+            language = task_plan["language"].lower()
 
-        Args:
-            task_description: The coding task description
-            task_plan: Optional task plan with sub-tasks
-            repo_analysis: Optional repository analysis context
+        lang_config = get_language_config(language)
+        code_block = lang_config["code_block"]
 
-        Returns:
-            Generated code as string
-        """
-        plan_info = ""
+        # Build structured context
+        plan_info = None
         if task_plan:
-            plan_info = f"""
-任务规划：
-主任务：{task_plan.get('task', '未知')}
+            plan_info = {
+                "task": task_plan.get("task", "Unknown"),
+                "language": language,
+                "sub_tasks": task_plan.get("sub_tasks", []),
+            }
 
-子任务分解：
-"""
-            for sub in task_plan.get('sub_tasks', []):
-                plan_info += f"- {sub.get('description', '')}\n"
-
-        repo_info = ""
+        repo_info = None
         if repo_analysis:
-            main_files = repo_analysis.get('main_files', [])[:3]  # Limit to first 3 files
-            if main_files:
-                repo_info = f"""
-代码库分析：
-主要相关文件：
-- {'\\n'.join(main_files)}
+            repo_info = {
+                "main_files": repo_analysis.get("main_files", [])[:3],
+                "key_imports": repo_analysis.get("key_patterns", {}).get("imports", [])[:5],
+            }
 
-关键接口：
-{'\\n'.join(repo_analysis.get('key_patterns', {}).get('imports', [])[:5])}
-"""
-
-        prompt = f"""你是一个专业的Python程序员。请根据用户需求和代码库上下文生成高质量的Python代码。
-
-{plan_info}
-{repo_info}
-
-用户需求：{task_description}
-
-要求：
-1. 代码必须是完整可运行的Python代码
-2. 必须用中文写好代码注释
-3. 必须用中文给函数和类写docstring说明
-4. 代码要遵循PEP8规范
-5. 要有适当的错误处理
-6. 只需要生成代码，不需要解释
-
-请只输出代码，用```python代码块包裹，不要输出任何其他内容："""
+        prompt = build_prompt(
+            IMPLEMENTER_GENERATE_PROMPT,
+            task=task_description,
+            language=language.upper(),
+            plan=plan_info,
+            repo_context=repo_info,
+            code_block_tag=code_block,
+        )
 
         try:
             response = self.client.invoke(prompt)
@@ -85,42 +106,15 @@ class Implementer:
             raise RuntimeError(f"代码生成失败: {str(e)}")
 
     def fix(self, original_code: str, review_result: Dict[str, Any]) -> str:
-        """
-        Fix code issues based on review feedback.
+        """Fix code issues based on review feedback."""
+        issues = review_result.get("issues", [])
 
-        Args:
-            original_code: The original generated code
-            review_result: The review result containing issues
-
-        Returns:
-            Fixed code as string
-        """
-        issues_text = ""
-        if review_result.get("issues"):
-            issues_text = "\n审查发现的问题：\n"
-            for i, issue in enumerate(review_result["issues"], 1):
-                issues_text += f"{i}. [{issue.get('severity', 'warning')}] {issue.get('description', '')}\n"
-                if issue.get('suggestion'):
-                    issues_text += f"   建议：{issue['suggestion']}\n"
-
-        prompt = f"""你是一个专业的Python程序员。请根据审查意见修复代码中的问题。
-
-原始代码：
-```python
-{original_code}
-```
-
-{issues_text}
-
-要求：
-1. 只输出修复后的完整代码
-2. 必须用中文写好代码注释
-3. 必须用中文给函数和类写docstring说明
-4. 修复所有审查发现的问题
-5. 保持代码的功能不变
-6. 只需要输出代码，不需要解释
-
-请只输出代码，用```python代码块包裹："""
+        prompt = build_prompt(
+            IMPLEMENTER_FIX_PROMPT,
+            original_code=original_code,
+            review_issues=issues,
+            review_summary=review_result.get("summary", ""),
+        )
 
         try:
             response = self.client.invoke(prompt)
@@ -134,8 +128,7 @@ class Implementer:
             else:
                 code_response = str(response)
 
-            import re
-            code_match = re.search(r'```python\s*(.*?)\s*```', code_response, re.DOTALL)
+            code_match = re.search(r'```(?:python)?\s*(.*?)\s*```', code_response, re.DOTALL)
             if code_match:
                 return code_match.group(1).strip()
             return code_response.strip() if code_response.strip() else original_code

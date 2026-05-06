@@ -527,7 +527,13 @@
     </div>
 
     <script>
-        let sessionId = 'session_' + Date.now();
+        // Try to get sessionId from URL params, otherwise generate new one
+        const urlParams = new URLSearchParams(window.location.search);
+        let sessionId = urlParams.get('session_id') || localStorage.getItem('chat_session_id') || 'session_' + Date.now();
+
+        // Save sessionId to localStorage for persistence
+        localStorage.setItem('chat_session_id', sessionId);
+
         let messageCount = 0;
         const API_BASE = 'http://127.0.0.1:8000';
 

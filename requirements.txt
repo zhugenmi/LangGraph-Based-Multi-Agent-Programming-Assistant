@@ -15,3 +15,5 @@ typing-extensions
 dataclasses-optional
 rich
 prompt_toolkit
+human-eval
+pathspec

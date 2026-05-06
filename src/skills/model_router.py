@@ -46,9 +46,9 @@ class ModelRouterSkill(BaseSkill):
         super().__init__(metadata)
 
         # Load model configuration from environment variables
-        self.model_name = os.getenv("BIGMODEL_MODEL")
-        self.model_base_url = os.getenv("BIGMODEL_BASE_URL")
-        self.model_api_key = os.getenv("BIGMODEL_API_KEY", "")
+        self.model_name = os.getenv("DEFAULT_MODEL")
+        self.model_base_url = os.getenv("DEFAULT_MODEL_BASE_URL")
+        self.model_api_key = os.getenv("DEFAULT_MODEL_API_KEY", "")
 
         # Model configurations
         self.models = self._initialize_models()

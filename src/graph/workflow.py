@@ -1,6 +1,7 @@
 """LangGraph workflow for multi-agent code generation"""
 
 import re
+import time
 from typing import TypedDict, Annotated, Sequence, Optional, Callable, Any
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -10,7 +11,7 @@ from src.agents.repo_analyst_agent import RepoAnalystAgent
 from src.agents.implementer import Implementer
 from src.agents.reviewer import ReviewerAgent
 from src.agents.tester import Tester
-from src.utils.logger import AgentLogger, get_model_name_from_env
+from src.utils.logger import AgentLogger, get_model_name_from_env, TaskTimer, set_task_id
 
 
 class WorkflowState(TypedDict):
@@ -21,6 +22,7 @@ class WorkflowState(TypedDict):
     repo_analysis: Optional[dict]
     task_type: Optional[str]  # "modify_existing" | "create_new" | "mixed"
     generated_code: Optional[str]
+    implementation_code: Optional[str]  # unified code from implementer/fixer
     review_result: Optional[dict]
     fixed_code: Optional[str]
     workflow_steps: list
@@ -32,7 +34,7 @@ class WorkflowState(TypedDict):
 
 
 def extract_code_from_response(response: str) -> str:
-    """Extract Python code from LLM response, removing explanations"""
+    """Extract code from LLM response, supporting multiple programming languages"""
     if not isinstance(response, str):
         if hasattr(response, 'content'):
             response = response.content
@@ -41,14 +43,21 @@ def extract_code_from_response(response: str) -> str:
         else:
             response = str(response)
 
-    code_match = re.search(r'```python\s*(.*?)\s*```', response, re.DOTALL)
-    if code_match:
-        return code_match.group(1).strip()
+    languages = ['python', 'javascript', 'java', 'cpp', 'c', 'go', 'rust', 'ruby', 'php',
+                 'swift', 'kotlin', 'typescript', 'bash', 'shell', 'sql', 'html', 'css']
+
+    for lang in languages:
+        code_match = re.search(rf'```{lang}\s*(.*?)\s*```', response, re.DOTALL | re.IGNORECASE)
+        if code_match:
+            return code_match.group(1).strip()
 
     code_match = re.search(r'```\s*(.*?)\s*```', response, re.DOTALL)
     if code_match:
         code = code_match.group(1).strip()
-        if any(keyword in code for keyword in ['def ', 'class ', 'import ', 'for ', 'while ', 'if ']):
+        code_indicators = ['def ', 'class ', 'function ', 'func ', 'public ', 'private ',
+                          'import ', 'from ', 'const ', 'let ', 'var ', 'struct ', 'enum ',
+                          'fn ', 'impl ', 'module ', 'package ', 'interface ']
+        if any(keyword in code for keyword in code_indicators):
             return code
 
     lines = response.split('\n')
@@ -64,25 +73,34 @@ def extract_code_from_response(response: str) -> str:
     if code_lines:
         return '\n'.join(code_lines).strip()
 
+    code_indicators = ['def ', 'class ', 'function ', 'func ', 'public ', 'private ',
+                      'import ', 'from ', 'const ', 'let ', 'var ', 'struct ', 'enum ',
+                      'fn ', 'impl ', 'module ', 'package ', 'interface ']
     for i, line in enumerate(lines):
-        if re.match(r'^(def |class |import |from )', line.strip()):
+        if any(line.strip().startswith(indicator) for indicator in code_indicators):
             return '\n'.join(lines[i:]).strip()
 
     return response.strip()
 
 
+def _make_log(agent_name: str, task_id: str = "") -> AgentLogger:
+    """Create an AgentLogger with task_id for metrics tracking"""
+    model_name = get_model_name_from_env(agent_name)
+    return AgentLogger(agent_name, model_name=model_name, task_id=task_id)
+
+
 def plan_node(state: WorkflowState) -> WorkflowState:
     """Task planning node"""
     callback = state.get("progress_callback")
-    model_name = get_model_name_from_env("Supervisor")
-    log = AgentLogger("Supervisor", model_name=model_name)
+    task_id = state.get("session_id", "")
+    log = _make_log("Supervisor", task_id)
 
     try:
         log.start("任务规划")
+        set_task_id(task_id)
 
-        # 只在开始时发送一次 plan 进度
         if callback:
-            callback.add_step('plan', f'📋 Supervisor Agent ({model_name}) 正在分析任务...', 'running')
+            callback.add_step('plan', f'📋 Supervisor Agent 正在分析任务...', 'running')
 
         planner = SupervisorAgent()
         task_plan = planner.plan(state["task_description"])
@@ -112,22 +130,20 @@ def plan_node(state: WorkflowState) -> WorkflowState:
 def repo_analysis_node(state: WorkflowState) -> WorkflowState:
     """Repository analysis node"""
     callback = state.get("progress_callback")
-    model_name = get_model_name_from_env("RepoAnalyst")
-    log = AgentLogger("RepoAnalyst", model_name=model_name)
+    task_id = state.get("session_id", "")
+    log = _make_log("RepoAnalyst", task_id)
 
     try:
         log.start("代码库分析")
 
-        # 只在开始时发送一次 repo_analysis 进度
         if callback:
-            callback.add_step('repo_analysis', f'🔍 RepoAnalyst Agent ({model_name}) 正在分析代码库...', 'running')
+            callback.add_step('repo_analysis', '🔍 RepoAnalyst Agent 正在分析代码库...', 'running')
 
         analyst = RepoAnalystAgent()
         repo_analysis = analyst.analyze(state["task_description"])
 
         log.complete(f"分析完成，任务类型：{repo_analysis.get('task_type', 'modify_existing')}")
 
-        # Extract task type from analysis
         task_type = repo_analysis.get("task_type", "modify_existing")
 
         if callback:
@@ -165,15 +181,14 @@ def repo_analysis_node(state: WorkflowState) -> WorkflowState:
 def generate_node(state: WorkflowState) -> WorkflowState:
     """Code generation node"""
     callback = state.get("progress_callback")
-    model_name = get_model_name_from_env("Implementer")
-    log = AgentLogger("Implementer", model_name=model_name)
+    task_id = state.get("session_id", "")
+    log = _make_log("Implementer", task_id)
 
     try:
         log.start("代码生成")
 
-        # 只在开始时发送一次 generate 进度
         if callback:
-            callback.add_step('generate', f'💻 Implementer Agent ({model_name}) 正在编写代码...', 'running')
+            callback.add_step('generate', '💻 Implementer Agent 正在编写代码...', 'running')
 
         generator = Implementer()
         code_response = generator.generate(
@@ -192,6 +207,7 @@ def generate_node(state: WorkflowState) -> WorkflowState:
         return {
             **state,
             "generated_code": generated_code,
+            "implementation_code": generated_code,
             "workflow_steps": state.get("workflow_steps", []) + [{
                 "step_name": "implementer",
                 "description": "代码生成完成",
@@ -209,15 +225,14 @@ def generate_node(state: WorkflowState) -> WorkflowState:
 def review_node(state: WorkflowState) -> WorkflowState:
     """Code review node"""
     callback = state.get("progress_callback")
-    model_name = get_model_name_from_env("Reviewer")
-    log = AgentLogger("Reviewer", model_name=model_name)
+    task_id = state.get("session_id", "")
+    log = _make_log("Reviewer", task_id)
 
     try:
         log.start("代码审查")
 
-        # 只在开始时发送一次 review 进度
         if callback:
-            callback.add_step('review', f'🔍 Reviewer Agent ({model_name}) 正在审查代码...', 'running')
+            callback.add_step('review', '🔍 Reviewer Agent 正在审查代码...', 'running')
 
         reviewer = ReviewerAgent()
         review_result = reviewer.review(
@@ -251,15 +266,14 @@ def review_node(state: WorkflowState) -> WorkflowState:
 def fix_node(state: WorkflowState) -> WorkflowState:
     """Code fixing node"""
     callback = state.get("progress_callback")
-    model_name = get_model_name_from_env("Implementer")
-    log = AgentLogger("Implementer", model_name=model_name)
+    task_id = state.get("session_id", "")
+    log = _make_log("Implementer", task_id)
 
     try:
         log.start("代码修复")
 
-        # 只在开始时发送一次 fix 进度
         if callback:
-            callback.add_step('fix', f'🔧 Implementer Agent ({model_name}) 正在优化代码...', 'running')
+            callback.add_step('fix', '🔧 Implementer Agent 正在优化代码...', 'running')
 
         fixer = Implementer()
         fixed_code = fixer.fix(
@@ -275,6 +289,7 @@ def fix_node(state: WorkflowState) -> WorkflowState:
         return {
             **state,
             "fixed_code": fixed_code,
+            "implementation_code": fixed_code,
             "workflow_steps": state.get("workflow_steps", []) + [{
                 "step_name": "implementer",
                 "description": "代码修复完成",
@@ -292,23 +307,19 @@ def fix_node(state: WorkflowState) -> WorkflowState:
 def test_node(state: WorkflowState) -> WorkflowState:
     """Test execution node"""
     callback = state.get("progress_callback")
-    model_name = get_model_name_from_env("Tester")
-    log = AgentLogger("Tester", model_name=model_name)
+    task_id = state.get("session_id", "")
+    log = _make_log("Tester", task_id)
 
     try:
         log.start("测试执行")
 
-        # 只在开始时发送一次 test 进度
         if callback:
-            callback.add_step('test', f'🧪 Tester Agent ({model_name}) 正在生成和执行测试...', 'running')
+            callback.add_step('test', '🧪 Tester Agent 正在生成和执行测试...', 'running')
 
         tester = Tester()
-        code = state.get("generated_code", "") or state.get("fixed_code", "")
+        code = state.get("implementation_code") or state.get("generated_code", "") or state.get("fixed_code", "")
 
-        # Generate tests
         test_result = tester.generate_tests(code, state["task_description"])
-
-        # Run tests
         run_result = tester.run_tests(code, test_result.get("test_code"))
 
         log.complete(f"测试结果: {run_result.get('passed', 0)}通过, {run_result.get('failed', 0)}失败")
@@ -374,7 +385,6 @@ def should_continue_after_generator(state: WorkflowState) -> str:
     """Check if workflow should continue after code generation"""
     if state.get("error"):
         return "end"
-    # Check if we've exceeded max iterations
     if state.get("iteration_count", 0) >= state.get("max_iterations", 5):
         return "end"
     return "reviewer"
@@ -384,11 +394,9 @@ def should_continue_after_reviewer(state: WorkflowState) -> str:
     """Check if workflow should continue after review"""
     if state.get("error"):
         return "end"
-    # Check if we've exceeded max iterations
     if state.get("iteration_count", 0) >= state.get("max_iterations", 5):
         return "end"
 
-    # Check if review passed
     review_result = state.get("review_result", {})
     if review_result.get("needs_revision", False):
         return "fixer"
@@ -400,7 +408,6 @@ def should_continue_after_fixer(state: WorkflowState) -> str:
     """Check if workflow should continue after fixing"""
     if state.get("error"):
         return "end"
-    # Check if we've exceeded max iterations
     if state.get("iteration_count", 0) >= state.get("max_iterations", 5):
         return "end"
     return "implementer"
@@ -410,14 +417,15 @@ def should_continue_after_tester(state: WorkflowState) -> str:
     """Check if workflow should continue after testing"""
     if state.get("error"):
         return "end"
-    # Check if we've exceeded max iterations
-    if state.get("iteration_count", 0) >= state.get("max_iterations", 5):
+
+    iteration_count = state.get("iteration_count", 0)
+    max_iterations = state.get("max_iterations", 5)
+    if iteration_count >= max_iterations:
         return "end"
 
-    # Check if tests failed
     test_result = state.get("test_result", {}).get("execution", {})
-    if test_result.get("failed", 0) > 0:
-        return "implementer"  # Return to implementer for fixes
+    if test_result.get("failed", 0) > 0 or test_result.get("total", 0) == 0:
+        return "increment"
 
     return "end"
 
@@ -434,65 +442,59 @@ def create_workflow(max_iterations: int = 3):
     """Create the LangGraph workflow with enhanced structure"""
     workflow = StateGraph(WorkflowState)
 
-    # Add nodes
     workflow.add_node("supervisor", plan_node)
     workflow.add_node("repo_analyst", repo_analysis_node)
     workflow.add_node("implementer", generate_node)
     workflow.add_node("reviewer", review_node)
     workflow.add_node("fixer", fix_node)
     workflow.add_node("tester", test_node)
+    workflow.add_node("increment", increment_iteration)
+    workflow.add_node("end", lambda state: state)
 
-    # Set entry point
     workflow.set_entry_point("supervisor")
-
-    # Edges from supervisor
     workflow.add_edge("supervisor", "repo_analyst")
-
-    # Edge from repo_analyst to implementer
     workflow.add_edge("repo_analyst", "implementer")
 
-    # Conditional edges from implementer (generator)
     workflow.add_conditional_edges(
         "implementer",
         should_continue_after_generator,
         {
             "reviewer": "reviewer",
-            "end": END
+            "end": "end",
         }
     )
 
-    # Conditional edges from reviewer
     workflow.add_conditional_edges(
         "reviewer",
         should_continue_after_reviewer,
         {
             "fixer": "fixer",
             "tester": "tester",
-            "end": END
+            "end": "end",
         }
     )
 
-    # Conditional edges from fixer (loop back to implementer for revision)
     workflow.add_conditional_edges(
         "fixer",
         should_continue_after_fixer,
         {
             "implementer": "implementer",
-            "end": END
+            "end": "end",
         }
     )
 
-    # Conditional edges from tester (loop back to implementer if tests fail)
     workflow.add_conditional_edges(
         "tester",
         should_continue_after_tester,
         {
-            "implementer": "implementer",
-            "end": END
+            "increment": "increment",
+            "end": "end",
         }
     )
 
-    # Compile the workflow
+    workflow.add_edge("increment", "implementer")
+    workflow.add_edge("end", END)
+
     return workflow.compile()
 
 

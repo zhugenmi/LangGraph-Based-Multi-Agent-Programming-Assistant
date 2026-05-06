@@ -1,4 +1,8 @@
-"""Embedding client for generating text embeddings"""
+"""Embedding client for generating text embeddings
+
+Configuration in .env:
+
+"""
 
 import os
 import json
@@ -9,13 +13,34 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def get_embedding_config() -> Dict[str, Any]:
+    """Get embedding configuration from environment variables
+
+    Returns:
+        config dict with:
+        - model: model name
+        - base_url: API endpoint (local or remote)
+        - api_key: API key (optional for some local services)
+        - dimension: embedding dimension
+        - use_local_embedding: whether to use local ollama embedding
+    """
+    config = {
+        "model": os.getenv("EMBEDDING_MODEL", "bge-m3"),
+        "base_url": os.getenv("EMBEDDING_MODEL_BASE_URL", "http://localhost:11434"),
+        "api_key": os.getenv("EMBEDDING_MODEL_API_KEY", ""),
+        "dimension": int(os.getenv("EMBEDDING_DIMENSION", "1024")),
+        "use_local_embedding": os.getenv("USE_LOCAL_EMBEDDING", "true").lower() == "true"
+    }
+    return config
+
+
 class EmbeddingClient:
     """Client for generating text embeddings
 
-    Supports:
-    - OpenAI-compatible embedding APIs
-    - Local embedding models (sentence-transformers)
-    - Multiple embedding models
+    Architecture:
+    - Primary: Use EMBEDDING_MODEL_BASE_URL as API endpoint
+    - Fallback: Use sentence-transformers for local embedding (if enabled)
+
     """
 
     DEFAULT_MODEL = "text-embedding-ada-002"
@@ -24,49 +49,52 @@ class EmbeddingClient:
     def __init__(
         self,
         model: Optional[str] = None,
-        api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
         dimension: Optional[int] = None,
-        use_local: bool = False,
-        local_model: Optional[str] = None
+        use_local_embedding: Optional[bool] = None
     ):
         """Initialize embedding client
 
         Args:
-            model: Embedding model name
-            api_key: API key for remote embedding service
-            base_url: Base URL for embedding API
-            dimension: Embedding dimension
-            use_local: Whether to use local embedding model
-            local_model: Local model name (sentence-transformers)
+            model: Model name (default from env EMBEDDING_MODEL)
+            base_url: API endpoint (default from env EMBEDDING_MODEL_BASE_URL)
+            api_key: API key (default from env EMBEDDING_MODEL_API_KEY)
+            dimension: Embedding dimension (default from env EMBEDDING_DIMENSION)
+            use_local_embedding: Use local ollama embedding model directly
         """
-        self.model = model or os.getenv("EMBEDDING_MODEL", self.DEFAULT_MODEL)
-        self.api_key = api_key or os.getenv("EMBEDDING_MODEL_API_KEY", os.getenv("DEFAULT_MODEL_API_KEY", ""))
-        self.base_url = base_url or os.getenv("EMBEDDING_MODEL_BASE_URL", os.getenv("DEFAULT_MODEL_BASE_URL", ""))
-        self.dimension = dimension or int(os.getenv("EMBEDDING_DIMENSION", str(self.DEFAULT_DIMENSION)))
-        self.use_local = use_local
+        env_config = get_embedding_config()
 
-        # Local model
-        self._local_model = None
-        self._local_model_name = local_model or os.getenv("LOCAL_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        # API configuration (primary)
+        self.model = model or env_config["model"]
+        self.base_url = base_url or env_config["base_url"]
+        self.api_key = api_key or env_config["api_key"]
+        self.dimension = dimension or env_config["dimension"]
 
-        if use_local:
-            self._init_local_model()
+        # Local embedding configuration
+        self.use_local_embedding = use_local_embedding if use_local_embedding is not None else env_config["use_local_embedding"]
 
-    def _init_local_model(self):
-        """Initialize local embedding model"""
+        # Initialize local model (ollama) if use_local_embedding is True
+        self._ollama_available = False
+
+        if self.use_local_embedding:
+            self._init_ollama_model()
+
+    def _init_ollama_model(self):
+        """Initialize local ollama model"""
+        import requests
         try:
-            from sentence_transformers import SentenceTransformer
-            self._local_model = SentenceTransformer(self._local_model_name)
-            # Update dimension based on model
-            self.dimension = self._local_model.get_sentence_embedding_dimension()
-            print(f"Local embedding model initialized: {self._local_model_name} (dimension: {self.dimension})")
-        except ImportError:
-            print("Warning: sentence-transformers not installed, falling back to API")
-            self.use_local = False
+            # Check if ollama is running
+            response = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            if response.status_code == 200:
+                self._ollama_available = True
+                print(f"Local ollama model ready: {self.model} (base_url: {self.base_url})")
+            else:
+                self._ollama_available = False
+                print(f"Note: Ollama service not available")
         except Exception as e:
-            print(f"Warning: Failed to load local model: {e}, falling back to API")
-            self.use_local = False
+            self._ollama_available = False
+            print(f"Note: Failed to connect to ollama: {e}")
 
     def embed_text(self, text: str) -> List[float]:
         """Generate embedding for a single text
@@ -77,9 +105,14 @@ class EmbeddingClient:
         Returns:
             Embedding vector as list of floats
         """
-        if self.use_local and self._local_model:
-            return self._embed_local([text])[0]
+        # If use_local_embedding is True, use local ollama
+        if self.use_local_embedding:
+            if self._ollama_available:
+                return self._embed_ollama(text)
+            else:
+                raise RuntimeError("Local ollama model not available")
 
+        # Otherwise use API
         return self._embed_api(text)
 
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
@@ -91,18 +124,49 @@ class EmbeddingClient:
         Returns:
             List of embedding vectors
         """
-        if self.use_local and self._local_model:
-            return self._embed_local(texts)
+        # If use_local_embedding is True, use local ollama
+        if self.use_local_embedding:
+            if self._ollama_available:
+                return self._embed_batch_ollama(texts)
+            else:
+                raise RuntimeError("Local ollama model not available")
 
-        return [self._embed_api(text) for text in texts]
+        # Otherwise use API
+        return self._embed_batch_api(texts)
 
-    def _embed_local(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings using local model"""
-        if self._local_model is None:
-            raise RuntimeError("Local model not initialized")
+    def _embed_ollama(self, text: str) -> List[float]:
+        """Generate embedding using local ollama"""
+        import requests
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/embeddings",
+                json={"model": self.model, "prompt": text},
+                timeout=30
+            )
+            if response.status_code == 200:
+                result = response.json()
+                return result["embedding"]
+            else:
+                raise RuntimeError(f"Ollama API error: {response.status_code}")
+        except Exception as e:
+            raise RuntimeError(f"Ollama embedding failed: {e}")
 
-        embeddings = self._local_model.encode(texts)
-        return [emb.tolist() for emb in embeddings]
+    def _embed_batch_ollama(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings using local ollama in batch"""
+        import requests
+        embeddings = []
+        for text in texts:
+            response = requests.post(
+                f"{self.base_url}/api/embeddings",
+                json={"model": self.model, "prompt": text},
+                timeout=30
+            )
+            if response.status_code == 200:
+                result = response.json()
+                embeddings.append(result["embedding"])
+            else:
+                raise RuntimeError(f"Ollama API error: {response.status_code}")
+        return embeddings
 
     def _embed_api(self, text: str) -> List[float]:
         """Generate embedding using API"""
@@ -255,23 +319,22 @@ class EmbeddingClient:
         return {
             "model": self.model,
             "dimension": self.dimension,
-            "use_local": self.use_local,
-            "local_model": self._local_model_name if self.use_local else None,
-            "base_url": self.base_url if not self.use_local else None
+            "use_local_embedding": self.use_local_embedding,
+            "base_url": self.base_url
         }
 
 
 def get_embedding_client(
-    use_local: bool = False,
+    use_local_embedding: bool = True,
     model: Optional[str] = None
 ) -> EmbeddingClient:
     """Get embedding client instance
 
     Args:
-        use_local: Whether to use local model
+        use_local_embedding: Whether to use local embedding model directly
         model: Model name
 
     Returns:
         EmbeddingClient instance
     """
-    return EmbeddingClient(use_local=use_local, model=model)
+    return EmbeddingClient(use_local_embedding=use_local_embedding, model=model)

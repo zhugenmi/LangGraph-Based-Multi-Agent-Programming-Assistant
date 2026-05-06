@@ -3,8 +3,11 @@
 import subprocess
 import tempfile
 import os
+import time
 from typing import Dict, Any, Optional
 from src.llm.llm_model_client import get_agent_llm_client
+from src.utils.helpers import build_prompt
+from src.utils.prompts import TESTER_PROMPT
 
 
 class Tester:
@@ -15,52 +18,17 @@ class Tester:
         self.model = "bigmodel"
 
     def generate_tests(self, code: str, task_description: str) -> Dict[str, Any]:
-        """
-        Generate test cases for the given code.
+        """Generate test cases for the given code."""
+        class_name = self._extract_class_name(code)
+        func_name = self._get_function_name(code)
 
-        Args:
-            code: The code to generate tests for
-            task_description: Original task description
-
-        Returns:
-            Dict containing generated tests
-        """
-        prompt = f"""你是一个专业的测试工程师。请为以下Python代码生成全面的单元测试。
-
-原始需求：{task_description}
-
-代码：
-```python
-{code}
-```
-
-请生成以下格式的测试代码（只输出测试代码，不要其他内容）：
-```python
-import unittest
-import pytest
-
-class Test{self._extract_class_name(code)}(unittest.TestCase):
-    def setUp(self):
-        # Setup code
-        pass
-
-    def test_{self._get_function_name(code)}_happy_path(self):
-        # Test happy path
-        pass
-
-    def test_{self._get_function_name(code)}_edge_cases(self):
-        # Test edge cases
-        pass
-
-if __name__ == '__main__':
-    unittest.main()
-```
-
-要求：
-1. 测试覆盖率至少80%
-2. 包含正常情况和边界情况
-3. 使用unittest或pytest框架
-4. 测试代码必须可直接运行"""
+        prompt = build_prompt(
+            TESTER_PROMPT,
+            task=task_description,
+            code=code,
+            class_name=class_name,
+            function_name=func_name,
+        )
 
         try:
             response = self.client.invoke(prompt)
@@ -78,6 +46,26 @@ if __name__ == '__main__':
             test_match = re.search(r'```python\s*(.*?)\s*```', test_code, re.DOTALL)
             if test_match:
                 test_code = test_match.group(1).strip()
+            else:
+                # Fallback: try to extract any code block
+                code_match = re.search(r'```\s*(.*?)\s*```', test_code, re.DOTALL)
+                if code_match:
+                    extracted = code_match.group(1).strip()
+                    # Only use if it contains test code indicators
+                    if any(kw in extracted for kw in ['def test_', 'assert ', 'import pytest', 'unittest']):
+                        test_code = extracted
+                    else:
+                        test_code = ""
+                else:
+                    test_code = ""
+
+            if not test_code or len(test_code.strip()) < 20:
+                return {
+                    "success": False,
+                    "error": "测试代码生成失败，LLM 返回内容不包含有效测试代码",
+                    "test_code": "",
+                    "test_framework": "unittest"
+                }
 
             return {
                 "success": True,
@@ -95,59 +83,56 @@ if __name__ == '__main__':
             }
 
     def run_tests(self, code: str, test_code: str = None) -> Dict[str, Any]:
-        """
-        Run tests on the given code.
-
-        Args:
-            code: The code to test
-            test_code: Optional test code to run
-
-        Returns:
-            Dict containing test results
-        """
+        """Run tests on the given code."""
+        original_cwd = os.getcwd()
         try:
-            # Create temporary directory
+            if not test_code or not test_code.strip():
+                gen_result = self.generate_tests(code, "Test code")
+                if not gen_result["success"]:
+                    return gen_result
+                test_code = gen_result["test_code"]
+
+            if not test_code or len(test_code.strip()) < 20:
+                return {
+                    "success": False,
+                    "error": "测试代码为空或无效",
+                    "output": "",
+                    "passed": 0,
+                    "failed": 0,
+                    "total": 0,
+                    "duration": 0,
+                }
+
             with tempfile.TemporaryDirectory() as temp_dir:
-                # Write the main code
                 main_file = os.path.join(temp_dir, "main.py")
                 with open(main_file, 'w', encoding='utf-8') as f:
                     f.write(code)
 
-                # If no test code provided, generate it
-                if not test_code:
-                    test_result = self.generate_tests(code, "Test code")
-                    if not test_result["success"]:
-                        return test_result
-                    test_code = test_result["test_code"]
-
-                # Write test code
                 test_file = os.path.join(temp_dir, "test_main.py")
                 with open(test_file, 'w', encoding='utf-8') as f:
                     f.write(test_code)
 
-                # Run tests
-                os.chdir(temp_dir)
+                start = time.time()
                 result = subprocess.run(
-                    ["python", "-m", "pytest", "test_main.py", "-v"],
+                    ["python", "-m", "pytest", "test_main.py", "-v", "--tb=short"],
                     capture_output=True,
                     text=True,
-                    timeout=30
+                    timeout=30,
+                    cwd=temp_dir
                 )
+                duration = time.time() - start
 
-                # Parse results
                 output = result.stdout + result.stderr
-                passed = len([line for line in output.split('\n') if ' PASSED' in line])
-                failed = len([line for line in output.split('\n') if ' FAILED' in line])
-                error = result.returncode != 0
+                passed, failed, error_info = self._parse_pytest_output(output, result.returncode)
 
                 return {
-                    "success": not error,
+                    "success": not error_info,
                     "passed": passed,
                     "failed": failed,
                     "total": passed + failed,
                     "output": output,
-                    "error": output if error else None,
-                    "duration": 0  # TODO: capture actual duration
+                    "error": output if error_info else None,
+                    "duration": round(duration, 3),
                 }
 
         except subprocess.TimeoutExpired:
@@ -157,7 +142,8 @@ if __name__ == '__main__':
                 "output": "",
                 "passed": 0,
                 "failed": 0,
-                "total": 0
+                "total": 0,
+                "duration": 30,
             }
         except Exception as e:
             return {
@@ -166,8 +152,42 @@ if __name__ == '__main__':
                 "output": "",
                 "passed": 0,
                 "failed": 0,
-                "total": 0
+                "total": 0,
+                "duration": 0,
             }
+        finally:
+            try:
+                os.chdir(original_cwd)
+            except OSError:
+                pass
+
+    def _parse_pytest_output(self, output: str, return_code: int = 0):
+        """Parse pytest output to extract pass/fail counts and error info."""
+        passed = 0
+        failed = 0
+        error_info = False
+
+        # Parse the summary line: "3 passed, 1 failed in 5.2s"
+        import re
+        summary_match = re.search(r'(\d+)\s+passed.*?(\d+)\s+failed', output)
+        if summary_match:
+            passed = int(summary_match.group(1))
+            failed = int(summary_match.group(2))
+        else:
+            # Fallback: count per-test results
+            passed = len([line for line in output.split('\n') if ' PASSED' in line])
+            failed = len([line for line in output.split('\n') if ' FAILED' in line])
+
+        # Check for collection errors (no tests collected, syntax errors, etc.)
+        lower_output = output.lower()
+        error_patterns = ['error collecting', 'no tests ran', 'importerror',
+                          'syntax error', 'fixture']
+        if any(p in lower_output for p in error_patterns):
+            error_info = True
+        if passed == 0 and failed == 0 and return_code != 0:
+            error_info = True
+
+        return passed, failed, error_info
 
     def _extract_class_name(self, code: str) -> str:
         """Extract main class name from code"""
@@ -183,26 +203,16 @@ if __name__ == '__main__':
 
     def _estimate_coverage(self, code: str, test_code: str) -> float:
         """Estimate test coverage (simplified)"""
-        # Simple heuristic based on number of lines
         code_lines = len([line for line in code.split('\n') if line.strip() and not line.strip().startswith('#')])
         test_lines = len([line for line in test_code.split('\n') if line.strip() and not line.strip().startswith('#')])
 
         if code_lines == 0:
             return 0.0
 
-        # Very rough estimate
         return min(0.8, test_lines / code_lines * 2)
 
     def analyze_test_results(self, test_results: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Analyze test results and provide feedback.
-
-        Args:
-            test_results: Results from test execution
-
-        Returns:
-            Dict with analysis and recommendations
-        """
+        """Analyze test results and provide feedback."""
         if not test_results.get("success"):
             return {
                 "status": "failed",

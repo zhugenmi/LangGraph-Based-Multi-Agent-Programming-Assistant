@@ -4,8 +4,12 @@ import os
 import json
 import pickle
 import time
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 try:
     import faiss
@@ -19,6 +23,36 @@ from .code_chunker import CodeChunker
 from .embedding_client import EmbeddingClient, get_embedding_client
 
 
+def get_rag_config() -> Dict[str, Any]:
+    """Get RAG configuration from environment variables"""
+    # Get embedding config from embedding_client
+    from .embedding_client import get_embedding_config as get_emb_config
+    emb_config = get_emb_config()
+
+    return {
+        # Embedding config (统一使用embedding_client的配置)
+        "embedding_model": emb_config["model"],
+        "embedding_api_key": emb_config["api_key"],
+        "embedding_base_url": emb_config["base_url"],
+        "embedding_dimension": emb_config["dimension"],
+
+        # Local embedding config
+        "use_local_embedding": os.getenv("USE_LOCAL_EMBEDDING", "true").lower() == "true",
+
+        # Chunk config
+        "chunk_size": int(os.getenv("CODE_CHUNK_SIZE", "500")),
+        "chunk_overlap": int(os.getenv("CODE_CHUNK_OVERLAP", "50")),
+
+        # Storage config
+        "index_dir": os.getenv("RAG_INDEX_DIR", "rag_index"),
+        "storage_dir": os.getenv("RAG_STORAGE_DIR", "memory_store"),
+
+        # File filter config
+        "file_extensions": [ext.strip() for ext in os.getenv("RAG_FILE_EXTENSIONS", ".py,.js,.ts,.jsx,.tsx,.md,.txt,.json,.yaml,.yml,.toml").split(",")],
+        "exclude_dirs": [d.strip() for d in os.getenv("RAG_EXCLUDE_DIRS", ".git,__pycache__,node_modules,venv,.venv,.env").split(",")]
+    }
+
+
 class CodeRAG:
     """RAG system for code semantic retrieval
 
@@ -27,17 +61,16 @@ class CodeRAG:
     - Semantic search for code snippets
     - Function/class level retrieval
     - Persistent index storage
+    - Configurable from environment variables
     """
-
-    DEFAULT_INDEX_DIR = "rag_index"
 
     def __init__(
         self,
         repo_path: str = ".",
         index_dir: Optional[str] = None,
         embedding_client: Optional[EmbeddingClient] = None,
-        chunk_size: int = 500,
-        use_local_embedding: bool = False
+        chunk_size: Optional[int] = None,
+        use_local_embedding: Optional[bool] = None
     ):
         """Initialize CodeRAG
 
@@ -45,16 +78,37 @@ class CodeRAG:
             repo_path: Path to the code repository
             index_dir: Directory for storing index files
             embedding_client: Custom embedding client
-            chunk_size: Size of code chunks
-            use_local_embedding: Whether to use local embedding model
+            chunk_size: Size of code chunks (default from env)
+            use_local_embedding: Use local embedding model (default from env USE_LOCAL_EMBEDDING)
         """
+        # Load config from environment
+        config = get_rag_config()
+
         self.repo_path = Path(repo_path).absolute()
-        self.index_dir = Path(index_dir or self.DEFAULT_INDEX_DIR)
+        self.index_dir = Path(index_dir or config["index_dir"])
         self.index_dir.mkdir(parents=True, exist_ok=True)
 
-        # Initialize components
-        self.chunker = CodeChunker(chunk_size=chunk_size)
-        self.embedding_client = embedding_client or get_embedding_client(use_local=use_local_embedding)
+        # Use provided values or fall back to environment config
+        chunk_size = chunk_size or config["chunk_size"]
+        use_local_embedding = use_local_embedding if use_local_embedding is not None else config.get("use_local_embedding", True)
+
+        # Initialize components with config
+        self.chunker = CodeChunker(
+            chunk_size=chunk_size,
+            overlap=config["chunk_overlap"],
+            repo_path=repo_path
+        )
+
+        # Initialize embedding client
+        if embedding_client is None:
+            embedding_client = get_embedding_client(
+                use_local_embedding=use_local_embedding,
+                model=config["embedding_model"]
+            )
+        self.embedding_client = embedding_client
+
+        # Store config for later use
+        self.config = config
 
         # Index storage
         self._index = None
@@ -66,6 +120,10 @@ class CodeRAG:
         self._index_file = self.index_dir / "code_index.faiss"
         self._chunks_file = self.index_dir / "chunks.pkl"
         self._metadata_file = self.index_dir / "metadata.pkl"
+        self._hashes_file = self.index_dir / "file_hashes.json"
+
+        # File content hash map (file_path -> sha256)
+        self._file_hashes: Dict[str, str] = {}
 
         # Load existing index if available
         self._load_index()
@@ -97,6 +155,26 @@ class CodeRAG:
                 print(f"Failed to load metadata: {e}")
                 self._index_metadata = []
 
+        self._load_file_hashes()
+
+    def _load_file_hashes(self):
+        """Load stored file hashes from disk"""
+        if self._hashes_file.exists():
+            try:
+                with open(self._hashes_file, 'r') as f:
+                    self._file_hashes = json.load(f)
+            except Exception as e:
+                print(f"Failed to load file hashes: {e}")
+                self._file_hashes = {}
+
+    def _save_file_hashes(self):
+        """Save file hashes to disk"""
+        try:
+            with open(self._hashes_file, 'w') as f:
+                json.dump(self._file_hashes, f, indent=2)
+        except Exception as e:
+            print(f"Failed to save file hashes: {e}")
+
     def _save_index(self):
         """Save index to disk"""
         if FAISS_AVAILABLE and self._index is not None:
@@ -111,6 +189,8 @@ class CodeRAG:
         with open(self._metadata_file, 'wb') as f:
             pickle.dump(self._index_metadata, f)
 
+        self._save_file_hashes()
+
     def build_index(
         self,
         extensions: Optional[List[str]] = None,
@@ -120,24 +200,31 @@ class CodeRAG:
         """Build index from repository
 
         Args:
-            extensions: File extensions to include
-            exclude_dirs: Directories to exclude
+            extensions: File extensions to include (default from env)
+            exclude_dirs: Directories to exclude (default from env)
             show_progress: Show progress messages
 
         Returns:
             Build statistics
         """
+        # Use config from environment if not provided
+        if extensions is None:
+            extensions = self.config.get("file_extensions", ['.py', '.js', '.ts'])
+        if exclude_dirs is None:
+            exclude_dirs = self.config.get("exclude_dirs", ['.git', '__pycache__', 'node_modules'])
+
         start_time = time.time()
 
-        # Chunk all files
+        # Chunk all files (with hashes for incremental tracking)
         if show_progress:
             print(f"Chunking files from {self.repo_path}...")
 
-        chunks = self.chunker.chunk_directory(
+        chunks, file_hashes = self.chunker.chunk_directory_with_hashes(
             str(self.repo_path),
             extensions=extensions,
             exclude_dirs=exclude_dirs
         )
+        self._file_hashes = file_hashes
 
         if not chunks:
             return {
@@ -207,6 +294,168 @@ class CodeRAG:
 
         return result
 
+    def incremental_update(
+        self,
+        extensions: Optional[List[str]] = None,
+        exclude_dirs: Optional[List[str]] = None,
+        rebuild_threshold: int = 50,
+        show_progress: bool = True
+    ) -> Dict[str, Any]:
+        """Incrementally update the index by only processing changed files.
+
+        Compares current file content hashes with stored hashes to detect:
+        - New files: chunk and embed
+        - Changed files: remove old chunks, re-chunk and embed
+        - Deleted files: remove old chunks
+
+        If the total number of affected files exceeds rebuild_threshold,
+        performs a full rebuild instead (since FAISS doesn't support deletion).
+
+        Args:
+            extensions: File extensions to include
+            exclude_dirs: Directories to exclude
+            rebuild_threshold: Max affected files before forcing full rebuild
+            show_progress: Show progress messages
+
+        Returns:
+            Update statistics
+        """
+        if extensions is None:
+            extensions = self.config.get("file_extensions", ['.py', '.js', '.ts'])
+        if exclude_dirs is None:
+            exclude_dirs = self.config.get("exclude_dirs", ['.git', '__pycache__', 'node_modules'])
+
+        start_time = time.time()
+
+        # Scan current files and compute hashes
+        if show_progress:
+            print(f"Scanning files in {self.repo_path}...")
+
+        current_chunks, current_hashes = self.chunker.chunk_directory_with_hashes(
+            str(self.repo_path),
+            extensions=extensions,
+            exclude_dirs=exclude_dirs
+        )
+
+        stored_hashes = self._file_hashes
+        stored_path_set: Set[str] = set(stored_hashes.keys())
+        current_path_set: Set[str] = set(current_hashes.keys())
+
+        # Classify files
+        new_files = current_path_set - stored_path_set
+        deleted_files = stored_path_set - current_path_set
+        common_files = current_path_set & stored_path_set
+        changed_files = {
+            f for f in common_files
+            if current_hashes[f] != stored_hashes[f]
+        }
+
+        affected_count = len(new_files) + len(changed_files) + len(deleted_files)
+
+        # If too many files changed, do a full rebuild
+        if affected_count > 0 and affected_count >= rebuild_threshold:
+            if show_progress:
+                print(f"Affected files ({affected_count}) >= threshold ({rebuild_threshold}), full rebuild")
+            return self.build_index(extensions, exclude_dirs, show_progress)
+
+        # No changes
+        if affected_count == 0:
+            duration = time.time() - start_time
+            return {
+                "success": True,
+                "mode": "no_change",
+                "new_files": 0,
+                "changed_files": 0,
+                "deleted_files": 0,
+                "total_chunks": len(self._chunks),
+                "duration": round(duration, 2)
+            }
+
+        # Build reverse index: file_path -> list of chunk indices
+        file_to_chunk_ids: Dict[str, List[int]] = {}
+        for i, chunk in enumerate(self._chunks):
+            if chunk is None:
+                continue
+            fp = chunk["metadata"].get("file_path", "")
+            if fp:
+                file_to_chunk_ids.setdefault(fp, []).append(i)
+
+        # Mark chunks for removed/changed files as None
+        removed_count = 0
+        for fp in deleted_files | changed_files:
+            for cid in file_to_chunk_ids.get(fp, []):
+                self._chunks[cid] = None
+                self._embeddings[cid] = None
+                self._index_metadata[cid] = None
+                removed_count += 1
+
+        # Add new chunks for new and changed files
+        added_count = 0
+        files_to_add = new_files | changed_files
+        new_chunks_to_embed = [
+            c for c in current_chunks
+            if c["metadata"].get("file_path", "") in files_to_add
+        ]
+
+        if new_chunks_to_embed:
+            if show_progress:
+                print(f"Embedding {len(new_chunks_to_embed)} chunks for {len(files_to_add)} changed/new files...")
+
+            texts = [c["content"] for c in new_chunks_to_embed]
+            new_embeddings = self.embedding_client.embed_texts(texts)
+
+            if show_progress:
+                print(f"Adding chunks to index...")
+
+            # Append to internal storage
+            base_id = len(self._chunks)
+            for i, (chunk, emb) in enumerate(zip(new_chunks_to_embed, new_embeddings)):
+                cid = base_id + i
+                self._chunks.append(chunk)
+                self._embeddings.append(emb)
+                self._index_metadata.append({
+                    "chunk_id": cid,
+                    "file_path": chunk["metadata"].get("file_path", ""),
+                    "type": chunk["metadata"].get("type", ""),
+                    "name": chunk["metadata"].get("name", ""),
+                    "language": chunk["metadata"].get("language", "")
+                })
+
+            # Add vectors to FAISS index
+            if FAISS_AVAILABLE and self._index is not None:
+                vectors = np.array(new_embeddings, dtype=np.float32)
+                self._index.add(vectors)
+
+            added_count = len(new_chunks_to_embed)
+
+        # Update stored hashes
+        self._file_hashes = current_hashes
+
+        # Save
+        self._save_index()
+
+        duration = time.time() - start_time
+        result = {
+            "success": True,
+            "mode": "incremental",
+            "new_files": len(new_files),
+            "changed_files": len(changed_files),
+            "deleted_files": len(deleted_files),
+            "chunks_added": added_count,
+            "chunks_removed": removed_count,
+            "total_chunks": len(self._chunks),
+            "active_chunks": sum(1 for c in self._chunks if c is not None),
+            "index_size": self._index.ntotal if FAISS_AVAILABLE and self._index else 0,
+            "duration": round(duration, 2)
+        }
+
+        if show_progress:
+            print(f"Incremental update done in {duration:.2f}s")
+            print(f"  New: {len(new_files)}, Changed: {len(changed_files)}, Deleted: {len(deleted_files)}")
+            print(f"  Chunks added: {added_count}, Removed: {removed_count}")
+
+        return result
+
     def search(
         self,
         query: str,
@@ -242,6 +491,10 @@ class CodeRAG:
                     continue
 
                 chunk = self._chunks[idx]
+                # Skip chunks that were marked as removed by incremental update
+                if chunk is None:
+                    continue
+
                 metadata = chunk.get("metadata", {})
 
                 # Apply filters
@@ -266,6 +519,8 @@ class CodeRAG:
             # Simple similarity search without FAISS
             similarities = []
             for i, embedding in enumerate(self._embeddings):
+                if embedding is None or self._chunks[i] is None:
+                    continue
                 similarity = self.embedding_client.get_similarity(query_embedding, embedding)
                 similarities.append((i, similarity))
 
@@ -437,7 +692,8 @@ class CodeRAG:
 
         # Note: FAISS doesn't support removal, so we mark and rebuild on save
         self._chunks[chunk_id] = None
-        self._embeddings[chunk_id] = None
+        if chunk_id < len(self._embeddings):
+            self._embeddings[chunk_id] = None
 
     def get_stats(self) -> Dict[str, Any]:
         """Get index statistics"""
@@ -457,13 +713,14 @@ class CodeRAG:
         self._chunks = []
         self._embeddings = []
         self._index_metadata = []
+        self._file_hashes = {}
 
         if FAISS_AVAILABLE:
             dimension = self.embedding_client.dimension
             self._index = faiss.IndexFlatL2(dimension)
 
         # Remove files
-        for file_path in [self._index_file, self._chunks_file, self._metadata_file]:
+        for file_path in [self._index_file, self._chunks_file, self._metadata_file, self._hashes_file]:
             if file_path.exists():
                 file_path.unlink()
 
@@ -471,14 +728,18 @@ class CodeRAG:
 def create_code_rag(
     repo_path: str = ".",
     use_local_embedding: bool = True,
-    rebuild_index: bool = False
+    rebuild_index: bool = False,
+    incremental: bool = True,
+    rebuild_threshold: int = 50
 ) -> CodeRAG:
     """Create or load CodeRAG instance
 
     Args:
         repo_path: Repository path
         use_local_embedding: Use local embedding model
-        rebuild_index: Force rebuild index
+        rebuild_index: Force full rebuild index
+        incremental: If True and index exists, do incremental update (default)
+        rebuild_threshold: Max affected files before incremental forces full rebuild
 
     Returns:
         CodeRAG instance
@@ -490,5 +751,7 @@ def create_code_rag(
 
     if rebuild_index or len(rag._chunks) == 0:
         rag.build_index(show_progress=True)
+    elif incremental:
+        rag.incremental_update(show_progress=True, rebuild_threshold=rebuild_threshold)
 
     return rag

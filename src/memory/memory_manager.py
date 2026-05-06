@@ -25,7 +25,7 @@ class MemoryManager:
         user_id: str = "default",
         project_id: str = "default",
         storage_dir: Optional[str] = None,
-        use_redis: bool = False
+        use_redis: bool = None
     ):
         """Initialize memory manager
 
@@ -34,22 +34,28 @@ class MemoryManager:
             user_id: User identifier for long-term memory
             project_id: Project identifier for long-term memory
             storage_dir: Storage directory for long-term memory
-            use_redis: Whether to use Redis for short-term memory
+            use_redis: Whether to use Redis (default from env USE_REDIS)
         """
         self.session_id = session_id
         self.user_id = user_id
         self.project_id = project_id
+        self.storage_dir = storage_dir or os.getenv("RAG_STORAGE_DIR", "memory_store")
+
+        # Determine whether to use Redis (from param or env)
+        if use_redis is None:
+            use_redis = os.getenv("USE_REDIS", "false").lower() == "true"
 
         # Initialize memory components
         self._short_term = ShortTermMemory(
             session_id=session_id,
-            use_redis=use_redis
+            use_redis=use_redis,
+            storage_dir=self.storage_dir
         )
 
         self._long_term = LongTermMemory(
             user_id=user_id,
             project_id=project_id,
-            storage_dir=storage_dir
+            storage_dir=self.storage_dir
         )
 
         # Memory configuration
